@@ -12,7 +12,6 @@ from typing import List, Dict, Any
 from pathlib import Path
 
 import mlflow
-import mlflow.metrics.genai as genai_metrics
 from dotenv import load_dotenv
 
 from monolithic import MonolithicAgent
