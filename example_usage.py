@@ -100,11 +100,11 @@ def example_ensemble():
 
 
 def check_api_key():
-    """Check if OpenAI API key is configured."""
-    api_key = os.getenv("OPENAI_API_KEY")
+    """Check if Google API key is configured."""
+    api_key = os.getenv("GOOGLE_API_KEY")
     if not api_key or api_key == "your_api_key_here":
-        print("⚠️  WARNING: OpenAI API key not configured!")
-        print("Please set OPENAI_API_KEY in your .env file")
+        print("⚠️  WARNING: Google API key not configured!")
+        print("Please set GOOGLE_API_KEY in your .env file")
         print("Example:")
         print("  1. Copy .env.example to .env")
         print("  2. Edit .env and add your API key")
@@ -137,7 +137,7 @@ def main():
     except Exception as e:
         print(f"\n❌ Error running examples: {e}")
         print("\nMake sure you have:")
-        print("  1. Valid OpenAI API key in .env")
+        print("  1. Valid Google Gemini API key in .env")
         print("  2. Installed all requirements: pip install -r requirements.txt")
 
 

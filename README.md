@@ -1,6 +1,6 @@
 # Agent Systems Evaluation: Monolithic vs Ensemble
 
-An empirical comparison of a Monolithic Agent (single LLM) vs. a Multi-Agent Ensemble for document synthesis tasks. This project evaluates both approaches using MLflow for experiment tracking and LLM-as-a-judge for quality assessment.
+An empirical comparison of a Monolithic Agent (single LLM) vs. a Multi-Agent Ensemble for document synthesis tasks. This project evaluates both approaches using MLflow for experiment tracking, LLM-as-a-judge, and NLP metrics.
 
 ## Overview
 
@@ -19,13 +19,14 @@ This project implements and compares two approaches to document synthesis:
 - 📊 MLflow integration for experiment tracking and comparison
 - 💰 Cost and latency metrics for each approach
 - 🎯 LLM-as-a-judge evaluation for quality assessment
-- 📈 Reference-free metrics (completeness, coherence, accuracy, quality)
-- 📝 Sample documents and synthesis tasks included
+- 📈 NLP metrics: BERTScore and ROUGE for quantitative evaluation
+- 📄 PDF document support for realistic document processing
+- 📝 Sample PDF documents and synthesis tasks included
 
 ## Requirements
 
 - Python 3.8+
-- OpenAI API key
+- Google Gemini API key (free tier available)
 - Dependencies listed in `requirements.txt`
 
 ## Installation
@@ -41,10 +42,11 @@ cd agent-systems-eval
 pip install -r requirements.txt
 ```
 
-3. Set up your OpenAI API key:
+3. Set up your Google Gemini API key:
 ```bash
 cp .env.example .env
-# Edit .env and add your OpenAI API key
+# Edit .env and add your Google Gemini API key
+# Get your free API key at: https://ai.google.dev/gemini-api/docs/api-key
 ```
 
 ## Usage
@@ -58,11 +60,11 @@ python evaluate.py
 ```
 
 This will:
-- Load source documents from `data/source_documents/`
+- Load source PDF documents from `data/source_documents/`
 - Load synthesis tasks from `data/tasks/synthesis_tasks.json`
 - Run both monolithic and ensemble agents on all tasks
 - Track metrics in MLflow
-- Evaluate outputs using LLM-as-a-judge
+- Evaluate outputs using LLM-as-a-judge and NLP metrics
 - Save all results and artifacts
 
 ### Viewing Results
@@ -75,7 +77,7 @@ mlflow ui
 
 Then open http://localhost:5000 in your browser to:
 - Compare runs across both agent types
-- View metrics (cost, latency, quality scores)
+- View metrics (cost, latency, quality scores, NLP metrics)
 - Examine generated outputs and intermediate results
 - Analyze performance across different tasks
 
@@ -105,10 +107,10 @@ agent-systems-eval/
 ├── ensemble.py                # Multi-agent ensemble implementation
 ├── evaluate.py                # Main evaluation script with MLflow
 ├── data/
-│   ├── source_documents/      # Sample source documents
-│   │   ├── doc1_ai_history.txt
-│   │   ├── doc2_ml_fundamentals.txt
-│   │   └── doc3_ai_ethics.txt
+│   ├── source_documents/      # Sample PDF documents
+│   │   ├── doc1_ai_history.pdf
+│   │   ├── doc2_ml_fundamentals.pdf
+│   │   └── doc3_ai_ethics.pdf
 │   └── tasks/                 # Synthesis task definitions
 │       └── synthesis_tasks.json
 └── mlruns/                    # MLflow tracking data (generated)
@@ -120,7 +122,7 @@ agent-systems-eval/
 - **Latency**: Total time to complete synthesis
 - **Token Usage**: Prompt, completion, and total tokens
 - **API Calls**: Number of LLM API calls
-- **Estimated Cost**: Calculated based on token usage and model pricing
+- **Estimated Cost**: Calculated based on token usage and model pricing (Gemini free tier)
 
 ### Quality Metrics (LLM-as-a-judge)
 - **Completeness**: How fully the task requirements are addressed
@@ -129,6 +131,10 @@ agent-systems-eval/
 - **Quality**: Overall professional quality
 - **Overall**: Aggregate quality score
 
+### NLP Metrics
+- **BERTScore**: Precision, Recall, F1 measuring semantic similarity
+- **ROUGE**: ROUGE-1, ROUGE-2, ROUGE-L measuring n-gram overlap
+
 ### Ensemble-Specific Metrics
 - Token usage per agent (archivist, drafter, critic)
 - Intermediate outputs at each stage
@@ -136,15 +142,15 @@ agent-systems-eval/
 ## Configuration
 
 Environment variables (set in `.env`):
-- `OPENAI_API_KEY`: Your OpenAI API key (required)
-- `OPENAI_MODEL`: Model to use (default: gpt-4)
-- `OPENAI_JUDGE_MODEL`: Model for LLM-as-a-judge (default: same as OPENAI_MODEL)
+- `GOOGLE_API_KEY`: Your Google Gemini API key (required) - Get it at https://ai.google.dev/gemini-api/docs/api-key
+- `GEMINI_MODEL`: Model to use (default: gemini-2.0-flash-exp)
+- `GEMINI_JUDGE_MODEL`: Model for LLM-as-a-judge (default: same as GEMINI_MODEL)
 
 ## Adding Custom Tasks
 
 To add your own synthesis tasks:
 
-1. Add source documents to `data/source_documents/`
+1. Add source documents (PDF or text) to `data/source_documents/`
 2. Edit `data/tasks/synthesis_tasks.json` to add new tasks:
 
 ```json
@@ -162,8 +168,9 @@ To add your own synthesis tasks:
 
 The ensemble approach typically shows:
 - ✅ Higher quality scores (better organization and refinement)
+- ✅ Higher NLP metric scores (more comprehensive coverage)
 - ⚠️ Higher latency (3 sequential LLM calls)
-- ⚠️ Higher cost (more total tokens)
+- ⚠️ Higher cost (more total tokens, though minimal with Gemini free tier)
 - ✅ Better handling of complex synthesis tasks
 
 The monolithic approach typically shows:
@@ -171,6 +178,13 @@ The monolithic approach typically shows:
 - ✅ Lower cost (fewer tokens)
 - ⚠️ May miss nuances that benefit from specialized processing
 - ✅ Efficient for straightforward tasks
+
+## API Costs & Limits
+
+Using **Google Gemini 2.0 Flash** (free tier):
+- **Rate Limits**: 15 requests per minute, 1M tokens per minute, 1500 requests per day
+- **Cost**: Free tier available, or ~$0.000075/1K input tokens, ~$0.0003/1K output tokens
+- **Typical Cost per Task**: ~$0.0001-0.0003 per task (essentially free for development)
 
 ## License
 

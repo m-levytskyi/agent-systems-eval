@@ -29,9 +29,9 @@ def test_data_files():
     print("\nTesting data files...")
     
     required_files = [
-        "data/source_documents/doc1_ai_history.txt",
-        "data/source_documents/doc2_ml_fundamentals.txt",
-        "data/source_documents/doc3_ai_ethics.txt",
+        "data/source_documents/doc1_ai_history.pdf",
+        "data/source_documents/doc2_ml_fundamentals.pdf",
+        "data/source_documents/doc3_ai_ethics.pdf",
         "data/tasks/synthesis_tasks.json"
     ]
     
@@ -82,7 +82,7 @@ def test_agent_initialization():
     print("\nTesting agent initialization...")
     try:
         # Set a dummy API key for testing initialization
-        os.environ["OPENAI_API_KEY"] = "sk-dummy-key-for-testing"
+        os.environ["GOOGLE_API_KEY"] = "dummy-key-for-testing"
         
         from monolithic import MonolithicAgent
         from ensemble import EnsembleAgent
@@ -132,11 +132,8 @@ def test_metric_calculation():
             "total_tokens": 1500
         }
         
-        cost_gpt4 = estimate_cost(test_metrics, "gpt-4")
-        print(f"✓ GPT-4 cost estimation: ${cost_gpt4:.4f}")
-        
-        cost_gpt35 = estimate_cost(test_metrics, "gpt-3.5-turbo")
-        print(f"✓ GPT-3.5 cost estimation: ${cost_gpt35:.4f}")
+        cost_gemini = estimate_cost(test_metrics, "gemini-2.0-flash-exp")
+        print(f"✓ Gemini cost estimation: ${cost_gemini:.6f}")
         
         return True
     except Exception as e:

@@ -13,6 +13,8 @@ from pathlib import Path
 
 import mlflow
 from dotenv import load_dotenv
+from PyPDF2 import PdfReader
+import google.generativeai as genai
 
 from monolithic import MonolithicAgent
 from ensemble import EnsembleAgent
@@ -21,10 +23,19 @@ load_dotenv()
 
 
 def load_source_documents(doc_dir: str) -> List[str]:
-    """Load all source documents from the specified directory."""
+    """Load all source documents (PDF or text) from the specified directory."""
     documents = []
     doc_path = Path(doc_dir)
     
+    # Load PDF files
+    for filepath in sorted(doc_path.glob("*.pdf")):
+        reader = PdfReader(filepath)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n"
+        documents.append(text.strip())
+    
+    # Load text files (if any)
     for filepath in sorted(doc_path.glob("*.txt")):
         with open(filepath, "r") as f:
             documents.append(f.read())
@@ -42,26 +53,19 @@ def estimate_cost(metrics: Dict[str, Any], model: str) -> float:
     """
     Estimate API cost based on token usage and model pricing.
     
-    Pricing (as of 2024, approximate):
-    - GPT-4: $0.03/1K prompt tokens, $0.06/1K completion tokens
-    - GPT-3.5-turbo: $0.001/1K prompt tokens, $0.002/1K completion tokens
+    Pricing (as of 2024):
+    - Gemini Flash: Free tier up to 15 RPM, 1M TPM, 1500 RPD
+    - For paid: ~$0.000075/1K input tokens, ~$0.0003/1K output tokens
     """
-    pricing = {
-        "gpt-4": {"prompt": 0.03, "completion": 0.06},
-        "gpt-4-turbo": {"prompt": 0.01, "completion": 0.03},
-        "gpt-3.5-turbo": {"prompt": 0.001, "completion": 0.002},
-    }
+    # Gemini pricing (very low cost)
+    if "gemini" in model.lower():
+        pricing = {"prompt": 0.000075, "completion": 0.0003}
+    else:
+        # Default fallback pricing
+        pricing = {"prompt": 0.001, "completion": 0.002}
     
-    # Default to GPT-4 pricing if model not found
-    model_key = "gpt-4"
-    for key in pricing.keys():
-        if key in model.lower():
-            model_key = key
-            break
-    
-    rates = pricing[model_key]
-    prompt_cost = (metrics["prompt_tokens"] / 1000) * rates["prompt"]
-    completion_cost = (metrics["completion_tokens"] / 1000) * rates["completion"]
+    prompt_cost = (metrics["prompt_tokens"] / 1000) * pricing["prompt"]
+    completion_cost = (metrics["completion_tokens"] / 1000) * pricing["completion"]
     
     return prompt_cost + completion_cost
 
@@ -103,22 +107,18 @@ def evaluate_with_llm_judge(task_description: str, synthesis: str, model: str) -
     Returns:
         Dictionary of scores
     """
-    from openai import OpenAI
-    
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    api_key = os.getenv("GOOGLE_API_KEY")
+    genai.configure(api_key=api_key)
+    client = genai.GenerativeModel(model)
     judge_prompt = create_llm_judge_prompt(task_description, synthesis)
     
-    response = client.chat.completions.create(
-        model=model,
-        messages=[
-            {"role": "system", "content": "You are an expert evaluator of document synthesis quality."},
-            {"role": "user", "content": judge_prompt}
-        ],
-        temperature=0.3
+    response = client.generate_content(
+        judge_prompt,
+        generation_config=genai.types.GenerationConfig(temperature=0.3)
     )
     
     # Parse scores from response
-    content = response.choices[0].message.content
+    content = response.text
     scores = {}
     
     for line in content.split('\n'):
@@ -133,6 +133,49 @@ def evaluate_with_llm_judge(task_description: str, synthesis: str, model: str) -
                         pass
     
     return scores
+
+
+def compute_nlp_metrics(reference: str, hypothesis: str) -> Dict[str, float]:
+    """
+    Compute NLP metrics (BERTScore, ROUGE) between reference and hypothesis.
+    
+    Args:
+        reference: Reference text (ground truth or source documents)
+        hypothesis: Generated text (synthesis output)
+        
+    Returns:
+        Dictionary of NLP metric scores
+    """
+    metrics = {}
+    
+    try:
+        # BERTScore
+        from bert_score import score as bert_score
+        P, R, F1 = bert_score([hypothesis], [reference], lang='en', verbose=False)
+        metrics['bertscore_precision'] = float(P[0])
+        metrics['bertscore_recall'] = float(R[0])
+        metrics['bertscore_f1'] = float(F1[0])
+    except Exception as e:
+        print(f"Warning: BERTScore computation failed: {e}")
+        metrics['bertscore_precision'] = 0.0
+        metrics['bertscore_recall'] = 0.0
+        metrics['bertscore_f1'] = 0.0
+    
+    try:
+        # ROUGE scores
+        from rouge_score import rouge_scorer
+        scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+        scores = scorer.score(reference, hypothesis)
+        metrics['rouge1_f1'] = scores['rouge1'].fmeasure
+        metrics['rouge2_f1'] = scores['rouge2'].fmeasure
+        metrics['rougeL_f1'] = scores['rougeL'].fmeasure
+    except Exception as e:
+        print(f"Warning: ROUGE computation failed: {e}")
+        metrics['rouge1_f1'] = 0.0
+        metrics['rouge2_f1'] = 0.0
+        metrics['rougeL_f1'] = 0.0
+    
+    return metrics
 
 
 def run_experiment(
@@ -202,6 +245,15 @@ def run_experiment(
             for criterion, score in judge_scores.items():
                 mlflow.log_metric(f"judge_{criterion}_score", score)
             
+            # Compute NLP metrics (using concatenated source documents as reference)
+            print(f"Computing NLP metrics (BERTScore, ROUGE)...")
+            reference_text = "\n\n".join(source_documents)
+            nlp_metrics = compute_nlp_metrics(reference_text, output)
+            
+            # Log NLP metrics
+            for metric_name, metric_value in nlp_metrics.items():
+                mlflow.log_metric(metric_name, metric_value)
+            
             # Log artifacts
             output_file = f"{agent_type}_{task_id}_output.txt"
             with open(output_file, "w") as f:
@@ -226,6 +278,9 @@ def run_experiment(
             print(f"\nJudge Scores:")
             for criterion, score in judge_scores.items():
                 print(f"  {criterion.capitalize()}: {score}/5")
+            print(f"\nNLP Metrics:")
+            for metric_name, metric_value in nlp_metrics.items():
+                print(f"  {metric_name}: {metric_value:.4f}")
 
 
 def main():
@@ -237,8 +292,8 @@ def main():
     # Configuration
     doc_dir = "data/source_documents"
     task_file = "data/tasks/synthesis_tasks.json"
-    model = os.getenv("OPENAI_MODEL", "gpt-4")
-    judge_model = os.getenv("OPENAI_JUDGE_MODEL", model)
+    model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp")
+    judge_model = os.getenv("GEMINI_JUDGE_MODEL", model)
     
     # Load data
     print("\nLoading source documents and tasks...")

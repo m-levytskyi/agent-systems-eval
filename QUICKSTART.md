@@ -5,7 +5,7 @@ This guide will help you get started with the agent systems evaluation in just a
 ## Prerequisites
 
 - Python 3.8 or higher
-- OpenAI API key ([Get one here](https://platform.openai.com/api-keys))
+- Google Gemini API key ([Get one FREE here](https://ai.google.dev/gemini-api/docs/api-key))
 - pip (Python package manager)
 
 ## Step-by-Step Setup
@@ -18,7 +18,7 @@ pip install -r requirements.txt
 
 ### 2. Configure Your API Key
 
-Create a `.env` file with your OpenAI API key:
+Create a `.env` file with your Google Gemini API key:
 
 ```bash
 cp .env.example .env
@@ -27,11 +27,11 @@ cp .env.example .env
 Edit `.env` and replace `your_api_key_here` with your actual API key:
 
 ```
-OPENAI_API_KEY=sk-your-actual-api-key-here
-OPENAI_MODEL=gpt-4
+GOOGLE_API_KEY=your-actual-api-key-here
+GEMINI_MODEL=gemini-2.0-flash-exp
 ```
 
-**Note:** Using GPT-4 is recommended for best quality, but you can also use `gpt-3.5-turbo` for lower costs.
+**Note:** The Gemini free tier provides 15 RPM, 1M TPM, 1500 RPD - perfect for development and testing!
 
 ### 3. Verify Installation
 
@@ -53,7 +53,7 @@ Run the example script with small documents:
 python example_usage.py
 ```
 
-This demonstrates both agents on simple tasks with minimal API costs (~$0.10).
+This demonstrates both agents on simple tasks with minimal API usage (essentially free with Gemini).
 
 ### Option B: Full Evaluation (Complete Comparison)
 
@@ -65,9 +65,10 @@ python evaluate.py
 
 This will:
 - Process 3 synthesis tasks with both agents (6 total runs)
-- Track all metrics in MLflow
+- Track all metrics in MLflow (cost, latency, quality, NLP metrics)
 - Generate quality scores using LLM-as-a-judge
-- Estimated cost: ~$2-5 depending on model
+- Compute BERTScore and ROUGE metrics
+- Estimated cost: $0.001-0.002 (essentially free with Gemini free tier!)
 
 ### Option C: Individual Agents
 
@@ -99,7 +100,8 @@ Then open http://localhost:5000 in your browser.
 2. **Runs**: Compare individual runs across tasks
 3. **Metrics**: 
    - Cost and latency (process metrics)
-   - Quality scores (LLM judge ratings)
+   - Quality scores (LLM judge ratings: completeness, coherence, accuracy)
+   - NLP metrics (BERTScore F1, ROUGE-1/2/L scores)
 4. **Artifacts**: View generated syntheses and intermediate outputs
 
 ## Understanding the Results
@@ -112,43 +114,45 @@ Then open http://localhost:5000 in your browser.
 ### Ensemble Agent
 - ✅ **Higher Quality**: Specialized agents for extraction, drafting, and refinement
 - ✅ **More Structured**: Clear separation of concerns
+- ✅ **Better NLP Scores**: More comprehensive document coverage
 - ⚠️ **Slower**: 3 sequential LLM calls
-- ⚠️ **More Expensive**: 3x the API calls
+- ⚠️ **More Token Usage**: 3x the API calls (but still minimal cost with Gemini)
 
 ## Customizing for Your Use Case
 
 ### Adding Your Own Documents
 
-1. Add text files to `data/source_documents/`
+1. Add PDF or text files to `data/source_documents/`
 2. Update `data/tasks/synthesis_tasks.json` with your tasks
 3. Run `evaluate.py`
 
 ### Changing the Model
 
-Edit `.env` to use a different model:
+Edit `.env` to use a different Gemini model:
 
 ```
-OPENAI_MODEL=gpt-3.5-turbo  # Cheaper option
+GEMINI_MODEL=gemini-1.5-flash  # Alternative model
 # or
-OPENAI_MODEL=gpt-4-turbo    # Faster GPT-4 variant
+GEMINI_MODEL=gemini-1.5-pro    # Higher capability model
 ```
 
 ### Adjusting Agent Behavior
 
 Edit the system prompts in:
-- `monolithic.py`: Line ~40
-- `ensemble.py`: Lines ~70, ~110, ~150 (for each agent role)
+- `monolithic.py`: Line ~60
+- `ensemble.py`: Lines ~90, ~120, ~150 (for each agent role)
 
 ## Troubleshooting
 
 ### "Invalid API Key" Error
 - Check your `.env` file
-- Ensure your API key starts with `sk-`
-- Verify your OpenAI account has credits
+- Get your free API key at https://ai.google.dev/gemini-api/docs/api-key
+- Verify your key is correctly set in GOOGLE_API_KEY
 
-### "Rate Limit" Error
-- Wait a few seconds and try again
-- Consider using `gpt-3.5-turbo` for higher rate limits
+### "Rate Limit" Error (Free Tier)
+- Free tier limits: 15 RPM, 1M TPM, 1500 RPD
+- Wait a few seconds between runs
+- Space out your evaluation runs if hitting limits
 
 ### Import Errors
 - Ensure all dependencies are installed: `pip install -r requirements.txt`
@@ -158,30 +162,43 @@ Edit the system prompts in:
 - Check if port 5000 is available
 - Try: `mlflow ui --port 5001`
 
+### PDF Loading Issues
+- Ensure PyPDF2 is installed: `pip install PyPDF2`
+- Check that PDF files are in `data/source_documents/`
+
 ## Next Steps
 
 - 📊 Compare metrics across multiple runs
 - 🔧 Tune prompts for your specific domain
 - 📈 Add more synthesis tasks
-- 🎯 Experiment with different models
+- 🎯 Experiment with different Gemini models
 - 📝 Analyze intermediate outputs from the ensemble
+- 📄 Try with your own PDF documents
 
 ## Cost Estimation
 
-Typical costs for the full evaluation (3 tasks, both agents):
+Using **Google Gemini 2.0 Flash** (free tier):
 
-- **GPT-4**: ~$2-5 per full evaluation
-- **GPT-3.5-turbo**: ~$0.10-0.20 per full evaluation
+- **Free Tier**: 15 RPM, 1M TPM, 1500 RPD - perfect for this evaluation!
+- **Paid Tier**: ~$0.000075/1K input tokens, ~$0.0003/1K output tokens
+
+Typical usage for the full evaluation (3 tasks, both agents):
+- **Total Cost**: ~$0.001-0.002 (essentially free!)
 
 Each task uses approximately:
-- Monolithic: 1,500-2,500 tokens
-- Ensemble: 4,500-7,500 tokens (3x agents)
+- Monolithic: 1,500-2,500 tokens (~$0.0002)
+- Ensemble: 4,500-7,500 tokens (~$0.0006)
+
+**Total for 6 runs: Less than $0.002!**
+
+Perfect for experimentation and development without worrying about costs.
 
 ## Support
 
 For issues or questions:
 - Check the main README.md
 - Review MLflow logs for detailed error messages
-- Ensure your API key has sufficient credits
+- Ensure you have a valid Google Gemini API key
+- Visit: https://ai.google.dev/gemini-api/docs for API documentation
 
 Happy evaluating! 🚀

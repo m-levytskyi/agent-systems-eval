@@ -8,7 +8,7 @@ to read source documents and synthesize them according to task requirements.
 import os
 import time
 from typing import List, Dict, Any
-from openai import OpenAI
+import google.generativeai as genai
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -22,11 +22,13 @@ class MonolithicAgent:
         Initialize the monolithic agent.
         
         Args:
-            model: OpenAI model to use (defaults to env OPENAI_MODEL or gpt-4)
-            api_key: OpenAI API key (defaults to env OPENAI_API_KEY)
+            model: Gemini model to use (defaults to env GEMINI_MODEL or gemini-2.0-flash-exp)
+            api_key: Google API key (defaults to env GOOGLE_API_KEY)
         """
-        self.model = model or os.getenv("OPENAI_MODEL", "gpt-4")
-        self.client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
+        self.model = model or os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp")
+        api_key = api_key or os.getenv("GOOGLE_API_KEY")
+        genai.configure(api_key=api_key)
+        self.client = genai.GenerativeModel(self.model)
         self.metrics = {
             "total_tokens": 0,
             "prompt_tokens": 0,
@@ -63,7 +65,9 @@ Guidelines:
 - Ensure the output directly addresses the task description
 - Be concise yet thorough"""
 
-        user_prompt = f"""Task: {task_description}
+        full_prompt = f"""{system_prompt}
+
+Task: {task_description}
 
 Source Documents:
 {documents_text}
@@ -71,14 +75,12 @@ Source Documents:
 Please synthesize the above documents to complete the task. Provide a well-structured, comprehensive response."""
 
         # Make API call
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.7,
-            max_tokens=2000
+        response = self.client.generate_content(
+            full_prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.7,
+                max_output_tokens=2000
+            )
         )
         
         end_time = time.time()
@@ -86,13 +88,15 @@ Please synthesize the above documents to complete the task. Provide a well-struc
         # Update metrics
         self.metrics["latency_seconds"] = end_time - start_time
         self.metrics["num_api_calls"] += 1
-        if response.usage:
-            self.metrics["prompt_tokens"] += response.usage.prompt_tokens
-            self.metrics["completion_tokens"] += response.usage.completion_tokens
-            self.metrics["total_tokens"] += response.usage.total_tokens
+        
+        # Gemini token usage
+        if hasattr(response, 'usage_metadata') and response.usage_metadata:
+            self.metrics["prompt_tokens"] += response.usage_metadata.prompt_token_count
+            self.metrics["completion_tokens"] += response.usage_metadata.candidates_token_count
+            self.metrics["total_tokens"] += response.usage_metadata.total_token_count
         
         return {
-            "output": response.choices[0].message.content,
+            "output": response.text,
             "metrics": self.metrics.copy(),
             "model": self.model
         }
@@ -110,9 +114,12 @@ if __name__ == "__main__":
     doc_dir = os.path.join(os.path.dirname(__file__), "data", "source_documents")
     documents = []
     for filename in sorted(os.listdir(doc_dir)):
-        if filename.endswith(".txt"):
-            with open(os.path.join(doc_dir, filename), "r") as f:
-                documents.append(f.read())
+        if filename.endswith(".txt") or filename.endswith(".pdf"):
+            filepath = os.path.join(doc_dir, filename)
+            if filename.endswith(".txt"):
+                with open(filepath, "r") as f:
+                    documents.append(f.read())
+            # PDF loading will be handled by evaluate.py
     
     # Example synthesis task
     task = "Write a comprehensive executive summary about artificial intelligence"
