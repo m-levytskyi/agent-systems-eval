@@ -1,0 +1,32 @@
+[
+  {
+    "task_id": "task1",
+    "task_description": "Write a comprehensive executive summary about the evolution and current state of artificial intelligence",
+    "expected_elements": [
+      "Historical overview of AI development",
+      "Key milestones and breakthroughs",
+      "Current applications and capabilities",
+      "Future implications"
+    ]
+  },
+  {
+    "task_id": "task2",
+    "task_description": "Create a technical overview of machine learning for business stakeholders",
+    "expected_elements": [
+      "Definition and core concepts",
+      "Types of machine learning approaches",
+      "Practical applications",
+      "Implementation considerations"
+    ]
+  },
+  {
+    "task_id": "task3",
+    "task_description": "Synthesize a balanced report on ethical considerations in AI development and deployment",
+    "expected_elements": [
+      "Major ethical concerns",
+      "Real-world examples and implications",
+      "Stakeholder responsibilities",
+      "Recommendations for responsible AI"
+    ]
+  }
+]
