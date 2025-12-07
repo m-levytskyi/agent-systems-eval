@@ -132,7 +132,7 @@ def test_metric_calculation():
             "total_tokens": 1500
         }
         
-        cost_gemini = estimate_cost(test_metrics, "gemini-2.0-flash-exp")
+        cost_gemini = estimate_cost(test_metrics, "gemini-2.0-flash")
         print(f"✓ Gemini cost estimation: ${cost_gemini:.6f}")
         
         return True

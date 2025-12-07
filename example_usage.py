@@ -2,7 +2,7 @@
 Example usage of the monolithic and ensemble agents.
 
 This script demonstrates how to use both agents with your own documents and tasks.
-Note: Requires a valid OPENAI_API_KEY in .env file.
+Note: Requires a valid Gemini API key in .env file.
 """
 
 import os
@@ -101,10 +101,10 @@ def example_ensemble():
 
 def check_api_key():
     """Check if Google API key is configured."""
-    api_key = os.getenv("GOOGLE_API_KEY")
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not api_key or api_key == "your_api_key_here":
         print("⚠️  WARNING: Google API key not configured!")
-        print("Please set GOOGLE_API_KEY in your .env file")
+        print("Please set GEMINI_API_KEY (or GOOGLE_API_KEY) in your .env file")
         print("Example:")
         print("  1. Copy .env.example to .env")
         print("  2. Edit .env and add your API key")

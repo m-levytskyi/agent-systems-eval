@@ -12,9 +12,12 @@ from typing import List, Dict, Any
 from pathlib import Path
 
 import mlflow
+from packaging.version import Version
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
-import google.generativeai as genai
+from google import genai
+from google.genai import types
+from rate_limits import RequestRateLimiter
 
 from monolithic import MonolithicAgent
 from ensemble import EnsembleAgent
@@ -95,7 +98,13 @@ Overall: X/5
 Briefly explain your ratings."""
 
 
-def evaluate_with_llm_judge(task_description: str, synthesis: str, model: str) -> Dict[str, float]:
+def evaluate_with_llm_judge(
+    task_description: str,
+    synthesis: str,
+    model: str,
+    client: genai.Client,
+    rate_limiter: RequestRateLimiter,
+) -> Dict[str, float]:
     """
     Evaluate synthesis quality using LLM-as-a-judge.
     
@@ -107,31 +116,34 @@ def evaluate_with_llm_judge(task_description: str, synthesis: str, model: str) -
     Returns:
         Dictionary of scores
     """
-    api_key = os.getenv("GOOGLE_API_KEY")
-    genai.configure(api_key=api_key)
-    client = genai.GenerativeModel(model)
     judge_prompt = create_llm_judge_prompt(task_description, synthesis)
-    
-    response = client.generate_content(
-        judge_prompt,
-        generation_config=genai.types.GenerationConfig(temperature=0.3)
+
+    if rate_limiter:
+        rate_limiter.acquire()
+
+    response = client.models.generate_content(
+        model=model,
+        contents=judge_prompt,
+        config=types.GenerateContentConfig(temperature=0.3)
     )
-    
-    # Parse scores from response
-    content = response.text
-    scores = {}
-    
+
+    content = response.text or ""
+    scores: Dict[str, float] = {}
+
     for line in content.split('\n'):
         if ':' in line:
             for criterion in ['Completeness', 'Coherence', 'Accuracy', 'Quality', 'Overall']:
                 if criterion.lower() in line.lower():
                     try:
-                        # Extract the numeric score (X from "X/5")
                         score_part = line.split(':')[1].strip().split('/')[0].strip()
                         scores[criterion.lower()] = float(score_part)
                     except (IndexError, ValueError):
                         pass
-    
+
+    # Ensure all criteria present
+    for criterion in ['completeness', 'coherence', 'accuracy', 'quality', 'overall']:
+        scores.setdefault(criterion, 0.0)
+
     return scores
 
 
@@ -147,6 +159,18 @@ def compute_nlp_metrics(reference: str, hypothesis: str) -> Dict[str, float]:
         Dictionary of NLP metric scores
     """
     metrics = {}
+
+    # Guard against missing outputs
+    reference = reference or ""
+    hypothesis = hypothesis or ""
+    if not reference or not hypothesis:
+        metrics['bertscore_precision'] = 0.0
+        metrics['bertscore_recall'] = 0.0
+        metrics['bertscore_f1'] = 0.0
+        metrics['rouge1_f1'] = 0.0
+        metrics['rouge2_f1'] = 0.0
+        metrics['rougeL_f1'] = 0.0
+        return metrics
     
     try:
         # BERTScore
@@ -183,7 +207,9 @@ def run_experiment(
     agent,
     source_documents: List[str],
     tasks: List[Dict[str, Any]],
-    judge_model: str
+    judge_model: str,
+    client: genai.Client,
+    rate_limiter: RequestRateLimiter,
 ) -> None:
     """
     Run an experiment for a specific agent type.
@@ -217,8 +243,11 @@ def run_experiment(
             print(f"{'='*60}")
             
             result = agent.synthesize(source_documents, task_description)
-            output = result["output"]
+            output = result.get("output") or ""
             metrics = result["metrics"]
+
+            if not output.strip():
+                print("⚠️  Model returned empty output; judge and NLP metrics will be zero.")
             
             # Calculate cost
             estimated_cost = estimate_cost(metrics, agent.model)
@@ -239,7 +268,13 @@ def run_experiment(
             
             # LLM-as-a-judge evaluation
             print(f"Evaluating output quality with LLM judge...")
-            judge_scores = evaluate_with_llm_judge(task_description, output, judge_model)
+            judge_scores = evaluate_with_llm_judge(task_description, output, judge_model, client, rate_limiter) if output else {
+                "completeness": 0.0,
+                "coherence": 0.0,
+                "accuracy": 0.0,
+                "quality": 0.0,
+                "overall": 0.0,
+            }
             
             # Log quality scores
             for criterion, score in judge_scores.items():
@@ -292,8 +327,11 @@ def main():
     # Configuration
     doc_dir = "data/source_documents"
     task_file = "data/tasks/synthesis_tasks.json"
-    model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash-exp")
+    model = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
     judge_model = os.getenv("GEMINI_JUDGE_MODEL", model)
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    rpm_limit = int(os.getenv("GEMINI_MAX_RPM", "4"))
+    rpd_limit = int(os.getenv("GEMINI_MAX_RPD", "15"))
     
     # Load data
     print("\nLoading source documents and tasks...")
@@ -305,20 +343,29 @@ def main():
     
     # Initialize MLflow
     mlflow.set_tracking_uri("file:./mlruns")
+    assert Version(mlflow.__version__) >= Version("2.18.0"), (
+        "This feature requires MLflow version 2.18.0 or newer. "
+        "Please upgrade mlflow to enable Gemini trace logging."
+    )
+    mlflow.gemini.autolog()
+
+    # Shared Gemini client and rate limiter across all calls
+    gemini_client = genai.Client(api_key=api_key)
+    rate_limiter = RequestRateLimiter(max_per_minute=rpm_limit, max_per_day=rpd_limit)
     
     # Run monolithic agent experiments
     print("\n" + "="*60)
     print("MONOLITHIC AGENT EVALUATION")
     print("="*60)
-    monolithic_agent = MonolithicAgent(model=model)
-    run_experiment("monolithic", monolithic_agent, source_documents, tasks, judge_model)
+    monolithic_agent = MonolithicAgent(model=model, client=gemini_client, rate_limiter=rate_limiter)
+    run_experiment("monolithic", monolithic_agent, source_documents, tasks, judge_model, gemini_client, rate_limiter)
     
     # Run ensemble agent experiments
     print("\n" + "="*60)
     print("ENSEMBLE AGENT EVALUATION")
     print("="*60)
-    ensemble_agent = EnsembleAgent(model=model)
-    run_experiment("ensemble", ensemble_agent, source_documents, tasks, judge_model)
+    ensemble_agent = EnsembleAgent(model=model, client=gemini_client, rate_limiter=rate_limiter)
+    run_experiment("ensemble", ensemble_agent, source_documents, tasks, judge_model, gemini_client, rate_limiter)
     
     print("\n" + "="*60)
     print("EVALUATION COMPLETE")
