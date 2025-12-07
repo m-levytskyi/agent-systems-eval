@@ -27,8 +27,9 @@ cp .env.example .env
 Edit `.env` and replace `your_api_key_here` with your actual API key:
 
 ```
+GEMINI_API_KEY=your-actual-api-key-here
 GOOGLE_API_KEY=your-actual-api-key-here
-GEMINI_MODEL=gemini-2.0-flash-exp
+GEMINI_MODEL=gemini-2.5-pro
 ```
 
 **Note:** The Gemini free tier provides 15 RPM, 1M TPM, 1500 RPD - perfect for development and testing!

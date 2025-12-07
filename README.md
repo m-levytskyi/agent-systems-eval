@@ -45,7 +45,7 @@ pip install -r requirements.txt
 3. Set up your Google Gemini API key:
 ```bash
 cp .env.example .env
-# Edit .env and add your Google Gemini API key
+# Edit .env and add your GEMINI_API_KEY (GOOGLE_API_KEY also supported)
 # Get your free API key at: https://ai.google.dev/gemini-api/docs/api-key
 ```
 
@@ -142,8 +142,9 @@ agent-systems-eval/
 ## Configuration
 
 Environment variables (set in `.env`):
-- `GOOGLE_API_KEY`: Your Google Gemini API key (required) - Get it at https://ai.google.dev/gemini-api/docs/api-key
-- `GEMINI_MODEL`: Model to use (default: gemini-2.0-flash-exp)
+- `GEMINI_API_KEY`: Your Google Gemini API key (preferred) - Get it at https://ai.google.dev/gemini-api/docs/api-key
+- `GOOGLE_API_KEY`: Backward-compatible fallback for the API key
+- `GEMINI_MODEL`: Model to use (default: gemini-2.5-pro)
 - `GEMINI_JUDGE_MODEL`: Model for LLM-as-a-judge (default: same as GEMINI_MODEL)
 
 ## Adding Custom Tasks
