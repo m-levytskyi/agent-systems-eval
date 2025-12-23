@@ -2,7 +2,7 @@
 Example usage of the monolithic and ensemble agents.
 
 This script demonstrates how to use both agents with your own documents and tasks.
-Note: Requires a valid Gemini API key in .env file.
+Note: Defaults to local Ollama. Set LLM_PROVIDER=gemini to use Gemini.
 """
 
 import os
@@ -100,14 +100,15 @@ def example_ensemble():
 
 
 def check_api_key():
-    """Check if Google API key is configured."""
+    """Validate required configuration for the selected provider."""
+    provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
+    if provider != "gemini":
+        return True
+
     api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
     if not api_key or api_key == "your_api_key_here":
-        print("⚠️  WARNING: Google API key not configured!")
+        print("⚠️  WARNING: Gemini API key not configured!")
         print("Please set GEMINI_API_KEY (or GOOGLE_API_KEY) in your .env file")
-        print("Example:")
-        print("  1. Copy .env.example to .env")
-        print("  2. Edit .env and add your API key")
         return False
     return True
 
@@ -120,7 +121,7 @@ def main():
     print()
     
     if not check_api_key():
-        print("\nSkipping examples (no API key configured)")
+        print("\nSkipping examples (missing required configuration)")
         return
     
     try:
