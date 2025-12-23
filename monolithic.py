@@ -8,10 +8,11 @@ to read source documents and synthesize them according to task requirements.
 import os
 import time
 from typing import List, Dict, Any, Optional
-from google import genai
-from google.genai import types
 from dotenv import load_dotenv
 from rate_limits import RequestRateLimiter
+
+from llm.base import LLMClient
+from llm.factory import create_llm_client, get_max_output_tokens
 
 load_dotenv()
 
@@ -21,9 +22,10 @@ class MonolithicAgent:
     
     def __init__(
         self,
-        model: str = None,
-        api_key: str = None,
-        client: Optional[genai.Client] = None,
+        model: Optional[str] = None,
+        api_key: Optional[str] = None,
+        client: Optional[object] = None,
+        llm_client: Optional[LLMClient] = None,
         rate_limiter: Optional[RequestRateLimiter] = None,
     ):
         """
@@ -33,11 +35,34 @@ class MonolithicAgent:
             model: Gemini model to use (defaults to env GEMINI_MODEL or gemini-2.5-pro)
             api_key: Gemini API key (defaults to env GEMINI_API_KEY or GOOGLE_API_KEY)
         """
-        self.model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
-        api_key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-        self.client = client or genai.Client(api_key=api_key)
+        # Backwards-compatible args: (model, api_key, client) were Gemini-specific.
+        # New path: pass llm_client or set LLM_PROVIDER=ollama.
+        self.llm_client: LLMClient
+        if llm_client is not None:
+            self.llm_client = llm_client
+        else:
+            # If a legacy Gemini client is passed, wrap it.
+            if client is not None:
+                from llm.gemini import GeminiClient
+
+                self.llm_client = GeminiClient(client=client, model=model or os.getenv("GEMINI_MODEL", "gemini-2.5-pro"))
+            else:
+                # If caller passes an api_key, prefer it for Gemini.
+                provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
+                if provider == "gemini" and api_key:
+                    from google import genai
+                    from llm.gemini import GeminiClient
+
+                    gemini_model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
+                    self.llm_client = GeminiClient(client=genai.Client(api_key=api_key), model=gemini_model)
+                else:
+                    # Factory reads env for provider + model.
+                    self.llm_client = create_llm_client(provider=provider)
+
+        # Keep `model` attribute for logging.
+        self.model = model or os.getenv("OLLAMA_MODEL") or os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
         self.rate_limiter = rate_limiter
-        self.max_output_tokens = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "4000"))
+        self.max_output_tokens = get_max_output_tokens(default=4000)
         self.metrics = {
             "total_tokens": 0,
             "prompt_tokens": 0,
@@ -74,34 +99,20 @@ Guidelines:
 - Ensure the output directly addresses the task description
 - Be concise yet thorough"""
 
-        full_prompt = f"""{system_prompt}
+        user_prompt = f"""Task: {task_description}
 
-Task: {task_description}
+    Source Documents:
+    {documents_text}
 
-Source Documents:
-{documents_text}
+    Please synthesize the above documents to complete the task. Provide a well-structured, comprehensive response."""
 
-Please synthesize the above documents to complete the task. Provide a well-structured, comprehensive response."""
-
-        # Make API call with a lightweight retry to reduce empty responses
-        response, output_text = self._generate_with_retry(full_prompt)
-
-        output_text = response.text or ""
+        # Make LLM call with a lightweight retry to reduce empty responses
+        output_text = self._generate_with_retry(system_prompt=system_prompt, user_prompt=user_prompt)
         
         end_time = time.time()
         
         # Update metrics
         self.metrics["latency_seconds"] = end_time - start_time
-        
-        # Gemini token usage
-        usage = getattr(response, "usage_metadata", None)
-        if usage:
-            prompt_tokens = getattr(usage, "input_tokens", getattr(usage, "prompt_token_count", 0)) or 0
-            completion_tokens = getattr(usage, "output_tokens", getattr(usage, "candidates_token_count", 0)) or 0
-            total_tokens = getattr(usage, "total_tokens", getattr(usage, "total_token_count", prompt_tokens + completion_tokens)) or 0
-            self.metrics["prompt_tokens"] += prompt_tokens
-            self.metrics["completion_tokens"] += completion_tokens
-            self.metrics["total_tokens"] += total_tokens
         
         return {
             "output": output_text,
@@ -109,47 +120,43 @@ Please synthesize the above documents to complete the task. Provide a well-struc
             "model": self.model
         }
 
-    def _generate_with_retry(self, contents: str, attempts: int = 2, backoff: float = 1.0):
+    def _generate_with_retry(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        attempts: int = 2,
+        backoff: float = 1.0,
+    ) -> str:
         """Generate content with a short retry loop to mitigate empty responses."""
-        last_response = None
+        last_text = ""
         for attempt in range(1, attempts + 1):
             if self.rate_limiter:
                 self.rate_limiter.acquire()
 
-            response = self.client.models.generate_content(
-                model=self.model,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    temperature=0.7,
-                    max_output_tokens=self.max_output_tokens
-                )
+            llm_result = self.llm_client.chat(
+                system=system_prompt,
+                user=user_prompt,
+                temperature=0.7,
+                max_tokens=self.max_output_tokens,
             )
             # Count this attempt
             self.metrics["num_api_calls"] += 1
 
-            usage = getattr(response, "usage_metadata", None)
-            if usage:
-                prompt_tokens = getattr(usage, "input_tokens", getattr(usage, "prompt_token_count", 0)) or 0
-                completion_tokens = getattr(usage, "output_tokens", getattr(usage, "candidates_token_count", 0)) or 0
-                total_tokens = getattr(usage, "total_tokens", getattr(usage, "total_token_count", prompt_tokens + completion_tokens)) or 0
-                self.metrics["prompt_tokens"] += prompt_tokens
-                self.metrics["completion_tokens"] += completion_tokens
-                self.metrics["total_tokens"] += total_tokens
+            self.metrics["prompt_tokens"] += int(llm_result.prompt_tokens or 0)
+            self.metrics["completion_tokens"] += int(llm_result.completion_tokens or 0)
+            self.metrics["total_tokens"] += int(llm_result.total_tokens or 0)
 
-            text = response.text or ""
+            text = llm_result.text or ""
             if text.strip():
-                return response, text
+                return text
 
-            finish_reason = None
-            if getattr(response, "candidates", None):
-                finish_reason = getattr(response.candidates[0], "finish_reason", None)
-            feedback = getattr(response, "prompt_feedback", None)
-            print(f"⚠️  Empty response (attempt {attempt}/{attempts}); finish_reason={finish_reason}, feedback={feedback}")
+            print(f"⚠️  Empty response (attempt {attempt}/{attempts})")
 
-            last_response = response
+            last_text = text
             if attempt < attempts:
                 time.sleep(backoff)
-        return last_response or response, text
+        return last_text
     
     def get_metrics(self) -> Dict[str, Any]:
         """Get current metrics."""
@@ -167,7 +174,7 @@ if __name__ == "__main__":
         if filename.endswith(".txt") or filename.endswith(".pdf"):
             filepath = os.path.join(doc_dir, filename)
             if filename.endswith(".txt"):
-                with open(filepath, "r") as f:
+                with open(filepath, "r", encoding="utf-8") as f:
                     documents.append(f.read())
             # PDF loading will be handled by evaluate.py
     
