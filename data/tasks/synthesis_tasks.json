@@ -1,32 +1,32 @@
 [
   {
     "task_id": "task1",
-    "task_description": "Write a comprehensive executive summary about the evolution and current state of artificial intelligence",
+    "task_description": "Define the academic scope, terminology, and technological context of the provided corpus",
     "expected_elements": [
-      "Historical overview of AI development",
-      "Key milestones and breakthroughs",
-      "Current applications and capabilities",
-      "Future implications"
+      "Primary sub-fields (e.g., HCI, CSCW, HRI)",
+      "Target agent technologies (e.g., LLM-based, Embodied, Reinforcement Learning)",
+      "Definitions of 'collaboration' and 'agent' used across the corpus",
+      "Scope boundaries and exclusions"
     ]
   },
   {
     "task_id": "task2",
-    "task_description": "Create a technical overview of machine learning for business stakeholders",
+    "task_description": "Perform a structured extraction of core research components for each individual paper",
     "expected_elements": [
-      "Definition and core concepts",
-      "Types of machine learning approaches",
-      "Practical applications",
-      "Implementation considerations"
+      "Explicit research questions or hypotheses",
+      "Methodological framework (e.g., User Study N=X, Wizard of Oz, Theoretical)",
+      "Key statistical findings and qualitative insights",
+      "Stated limitations and future work proposals"
     ]
   },
   {
     "task_id": "task3",
-    "task_description": "Synthesize a balanced report on ethical considerations in AI development and deployment",
+    "task_description": "Synthesize a comparative meta-analysis of interaction patterns and findings across the corpus",
     "expected_elements": [
-      "Major ethical concerns",
-      "Real-world examples and implications",
-      "Stakeholder responsibilities",
-      "Recommendations for responsible AI"
+      "Emergent themes in human-agent interaction dynamics",
+      "Consensus findings versus conflicting evidence across papers",
+      "Taxonomy of collaboration types identified",
+      "Critical research gaps detected in the aggregate corpus"
     ]
   }
 ]
