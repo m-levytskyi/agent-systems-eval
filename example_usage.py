@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import List, Dict, Any
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
+import mlflow
 from monolithic import MonolithicAgent
 from ensemble import EnsembleAgent
 
@@ -66,7 +67,17 @@ def example_monolithic(documents: List[str], task: str):
     # Run synthesis
     print(f"\nSynthesizing {len(documents)} documents...")
     print(f"Task: {task[:80]}..." if len(task) > 80 else f"Task: {task}")
-    result = agent.synthesize(documents, task)
+    with mlflow.start_run(run_name="example_monolithic", tags={"run_type": "example_usage", "agent": "monolithic"}):
+        mlflow.log_param("agent_type", "monolithic")
+        mlflow.log_param("task_excerpt", task[:120])
+        mlflow.log_param("num_documents", len(documents))
+
+        result = agent.synthesize(documents, task)
+
+        for key, value in result.get("metrics", {}).items():
+            mlflow.log_metric(key, value)
+
+        mlflow.log_text(result.get("output", ""), "example_monolithic_output.txt")
     
     # Display results
     print("\n" + "-"*60)
@@ -97,7 +108,24 @@ def example_ensemble(documents: List[str], task: str):
     # Run synthesis
     print(f"\nSynthesizing {len(documents)} documents with ensemble (3 agents)...")
     print(f"Task: {task[:80]}..." if len(task) > 80 else f"Task: {task}")
-    result = agent.synthesize(documents, task)
+    with mlflow.start_run(run_name="example_ensemble", tags={"run_type": "example_usage", "agent": "ensemble"}):
+        mlflow.log_param("agent_type", "ensemble")
+        mlflow.log_param("task_excerpt", task[:120])
+        mlflow.log_param("num_documents", len(documents))
+
+        result = agent.synthesize(documents, task)
+
+        # Metrics
+        for key, value in result.get("metrics", {}).items():
+            mlflow.log_metric(key, value)
+
+        # Intermediate artifacts
+        intermediate = result.get("intermediate_outputs", {})
+        if intermediate.get("archived_info"):
+            mlflow.log_text(str(intermediate["archived_info"]), "example_ensemble_archivist.txt")
+        if intermediate.get("draft"):
+            mlflow.log_text(str(intermediate["draft"]), "example_ensemble_draft.txt")
+        mlflow.log_text(result.get("output", ""), "example_ensemble_final.txt")
     
     # Display results
     print("\n" + "-"*60)
@@ -161,6 +189,10 @@ def main():
         print(f"Loaded {len(documents)} example documents")
         print(f"Loaded {len(tasks)} example tasks")
         
+        # Configure MLflow for example runs
+        mlflow.set_tracking_uri("file:./mlruns")
+        mlflow.set_experiment("examples_demo")
+
         # Run examples with first task
         if tasks:
             first_task = tasks[0]
