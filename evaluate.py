@@ -1,13 +1,11 @@
-"""
-Evaluation Script: Compare Monolithic vs Ensemble agents for document synthesis.
+"""Evaluate Monolithic vs Ensemble agents for document synthesis.
 
-This script runs both agent approaches on a set of tasks and source documents,
-tracking all metrics in MLflow and using LLM-as-a-judge for quality evaluation.
+Runs both agent approaches on a set of tasks and source documents, tracking metrics
+in MLflow and using MLflow GenAI LLM-judge scorers for quality evaluation.
 """
 
 import os
 import json
-import time
 from typing import List, Dict, Any
 from pathlib import Path
 
@@ -15,8 +13,6 @@ import mlflow
 from packaging.version import Version
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
-from google import genai
-from google.genai import types
 from rate_limits import RequestRateLimiter
 
 from monolithic import MonolithicAgent
@@ -40,7 +36,7 @@ def load_source_documents(doc_dir: str) -> List[str]:
     
     # Load text files (if any)
     for filepath in sorted(doc_path.glob("*.txt")):
-        with open(filepath, "r") as f:
+        with open(filepath, "r", encoding="utf-8") as f:
             documents.append(f.read())
     
     return documents
@@ -48,7 +44,7 @@ def load_source_documents(doc_dir: str) -> List[str]:
 
 def load_tasks(task_file: str) -> List[Dict[str, Any]]:
     """Load synthesis tasks from JSON file."""
-    with open(task_file, "r") as f:
+    with open(task_file, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -60,6 +56,10 @@ def estimate_cost(metrics: Dict[str, Any], model: str) -> float:
     - Gemini Flash: Free tier up to 15 RPM, 1M TPM, 1500 RPD
     - For paid: ~$0.000075/1K input tokens, ~$0.0003/1K output tokens
     """
+    provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
+    if provider == "ollama":
+        return 0.0
+
     # Gemini pricing (very low cost)
     if "gemini" in model.lower():
         pricing = {"prompt": 0.000075, "completion": 0.0003}
@@ -73,78 +73,114 @@ def estimate_cost(metrics: Dict[str, Any], model: str) -> float:
     return prompt_cost + completion_cost
 
 
-def create_llm_judge_prompt(task_description: str, synthesis: str) -> str:
-    """Create a prompt for LLM-as-a-judge evaluation."""
-    return f"""Evaluate the following document synthesis on a scale of 1-5 for each criterion:
+def _score_value_to_float(value: Any) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, bool):
+        return 1.0 if value else 0.0
+    if isinstance(value, (int, float)):
+        return float(value)
 
-Task: {task_description}
+    text = str(value).strip().lower()
+    if text in {"yes", "true", "y"}:
+        return 1.0
+    if text in {"no", "false", "n"}:
+        return 0.0
+    if text in {"fully"}:
+        return 1.0
+    if text in {"mostly"}:
+        return 0.75
+    if text in {"partially"}:
+        return 0.5
+    if text in {"not"}:
+        return 0.0
 
-Synthesized Document:
-{synthesis}
-
-Please rate the following aspects (1=Poor, 5=Excellent):
-1. Completeness: Does it fully address the task requirements?
-2. Coherence: Is the writing clear, logical, and well-structured?
-3. Accuracy: Is the information accurate and well-integrated?
-4. Quality: Overall professional quality of the synthesis
-
-Provide your ratings in this format:
-Completeness: X/5
-Coherence: X/5
-Accuracy: X/5
-Quality: X/5
-Overall: X/5
-
-Briefly explain your ratings."""
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
 
 
-def evaluate_with_llm_judge(
+def evaluate_with_mlflow_judges(
+    *,
     task_description: str,
     synthesis: str,
-    model: str,
-    client: genai.Client,
-    rate_limiter: RequestRateLimiter,
-) -> Dict[str, float]:
-    """
-    Evaluate synthesis quality using LLM-as-a-judge.
-    
-    Args:
-        task_description: The synthesis task
-        synthesis: The synthesized output
-        model: Model to use for judging
-        
-    Returns:
-        Dictionary of scores
-    """
-    judge_prompt = create_llm_judge_prompt(task_description, synthesis)
+    reference_text: str,
+    judge_model: str,
+) -> Dict[str, Any]:
+    """Evaluate synthesis quality using MLflow GenAI built-in LLM-judge scorers."""
+    try:
+        from mlflow.genai.scorers import RelevanceToQuery, Guidelines
+    except Exception as exc:
+        raise RuntimeError(
+            "MLflow GenAI scorers are not available. Install a recent MLflow version with GenAI support. "
+            "(e.g., `pip install -U mlflow`)."
+        ) from exc
 
-    if rate_limiter:
-        rate_limiter.acquire()
+    inputs = {"query": task_description, "context": reference_text}
 
-    response = client.models.generate_content(
-        model=model,
-        contents=judge_prompt,
-        config=types.GenerateContentConfig(temperature=0.3)
-    )
+    scorers = [
+        RelevanceToQuery(name="relevance_to_task", model=judge_model),
+        Guidelines(
+            name="completeness",
+            model=judge_model,
+            guidelines=(
+                "The synthesis must fully address the task requirements. "
+                "It should cover all key aspects implied by the task prompt."
+            ),
+        ),
+        Guidelines(
+            name="coherence",
+            model=judge_model,
+            guidelines=(
+                "The synthesis must be clear, logically structured, and coherent. "
+                "It should read as a single integrated document."
+            ),
+        ),
+        Guidelines(
+            name="grounded_in_sources",
+            model=judge_model,
+            guidelines=(
+                "All factual claims must be supported by the provided context in inputs.context. "
+                "Do not introduce unsupported facts."
+            ),
+        ),
+        Guidelines(
+            name="professional_quality",
+            model=judge_model,
+            guidelines=(
+                "The synthesis must be professional quality: accurate, appropriately detailed, and well written."
+            ),
+        ),
+    ]
 
-    content = response.text or ""
     scores: Dict[str, float] = {}
+    feedback: Dict[str, Any] = {}
+    for scorer in scorers:
+        name = getattr(scorer, "name", scorer.__class__.__name__)
+        fb = scorer(inputs=inputs, outputs=synthesis)
+        value = getattr(fb, "value", fb)
+        rationale = getattr(fb, "rationale", None)
+        scores[name] = _score_value_to_float(value)
+        feedback[name] = {"value": value, "rationale": rationale}
 
-    for line in content.split('\n'):
-        if ':' in line:
-            for criterion in ['Completeness', 'Coherence', 'Accuracy', 'Quality', 'Overall']:
-                if criterion.lower() in line.lower():
-                    try:
-                        score_part = line.split(':')[1].strip().split('/')[0].strip()
-                        scores[criterion.lower()] = float(score_part)
-                    except (IndexError, ValueError):
-                        pass
+    # For backward-compat with older metric names.
+    legacy = {
+        "completeness": scores.get("completeness", 0.0),
+        "coherence": scores.get("coherence", 0.0),
+        "accuracy": scores.get("grounded_in_sources", 0.0),
+        "quality": scores.get("professional_quality", 0.0),
+        "overall": (
+            scores.get("relevance_to_task", 0.0)
+            + scores.get("completeness", 0.0)
+            + scores.get("coherence", 0.0)
+            + scores.get("grounded_in_sources", 0.0)
+            + scores.get("professional_quality", 0.0)
+        )
+        / 5.0,
+    }
 
-    # Ensure all criteria present
-    for criterion in ['completeness', 'coherence', 'accuracy', 'quality', 'overall']:
-        scores.setdefault(criterion, 0.0)
-
-    return scores
+    return {"scores": legacy, "detailed": feedback}
 
 
 def compute_nlp_metrics(reference: str, hypothesis: str) -> Dict[str, float]:
@@ -208,8 +244,6 @@ def run_experiment(
     source_documents: List[str],
     tasks: List[Dict[str, Any]],
     judge_model: str,
-    client: genai.Client,
-    rate_limiter: RequestRateLimiter,
 ) -> None:
     """
     Run an experiment for a specific agent type.
@@ -265,24 +299,44 @@ def run_experiment(
                 mlflow.log_metric("archivist_tokens", metrics.get("archivist_tokens", 0))
                 mlflow.log_metric("drafter_tokens", metrics.get("drafter_tokens", 0))
                 mlflow.log_metric("critic_tokens", metrics.get("critic_tokens", 0))
+                mlflow.log_metric("orchestrator_tokens", metrics.get("orchestrator_tokens", 0))
+                mlflow.log_metric("num_iterations", metrics.get("num_iterations", 0))
             
             # LLM-as-a-judge evaluation
-            print(f"Evaluating output quality with LLM judge...")
-            judge_scores = evaluate_with_llm_judge(task_description, output, judge_model, client, rate_limiter) if output else {
+            print("Evaluating output quality with LLM judge...")
+            reference_text = "\n\n".join(source_documents)
+            judge_result = (
+                evaluate_with_mlflow_judges(
+                    task_description=task_description,
+                    synthesis=output,
+                    reference_text=reference_text,
+                    judge_model=judge_model,
+                )
+                if output
+                else {"scores": {
                 "completeness": 0.0,
                 "coherence": 0.0,
                 "accuracy": 0.0,
                 "quality": 0.0,
                 "overall": 0.0,
-            }
+            }, "detailed": {}}
+            )
+            judge_scores = judge_result["scores"]
             
             # Log quality scores
             for criterion, score in judge_scores.items():
                 mlflow.log_metric(f"judge_{criterion}_score", score)
+
+            # Store rationales as an artifact for later inspection
+            if judge_result.get("detailed"):
+                judge_file = f"{agent_type}_{task_id}_judge_feedback.json"
+                with open(judge_file, "w", encoding="utf-8") as f:
+                    json.dump(judge_result["detailed"], f, ensure_ascii=False, indent=2)
+                mlflow.log_artifact(judge_file)
+                os.remove(judge_file)
             
             # Compute NLP metrics (using concatenated source documents as reference)
-            print(f"Computing NLP metrics (BERTScore, ROUGE)...")
-            reference_text = "\n\n".join(source_documents)
+            print("Computing NLP metrics (BERTScore, ROUGE)...")
             nlp_metrics = compute_nlp_metrics(reference_text, output)
             
             # Log NLP metrics
@@ -291,29 +345,59 @@ def run_experiment(
             
             # Log artifacts
             output_file = f"{agent_type}_{task_id}_output.txt"
-            with open(output_file, "w") as f:
+            with open(output_file, "w", encoding="utf-8") as f:
                 f.write(output)
             mlflow.log_artifact(output_file)
             os.remove(output_file)
             
             # Log intermediate outputs for ensemble
             if agent_type == "ensemble" and "intermediate_outputs" in result:
-                for stage, content in result["intermediate_outputs"].items():
-                    stage_file = f"{agent_type}_{task_id}_{stage}.txt"
-                    with open(stage_file, "w") as f:
-                        f.write(content)
-                    mlflow.log_artifact(stage_file)
-                    os.remove(stage_file)
+                intermediate = result["intermediate_outputs"]
+                
+                # Log archived_info and draft
+                for stage in ["archived_info", "draft"]:
+                    if stage in intermediate:
+                        stage_file = f"{agent_type}_{task_id}_{stage}.txt"
+                        with open(stage_file, "w", encoding="utf-8") as f:
+                            f.write(str(intermediate[stage]))
+                        mlflow.log_artifact(stage_file)
+                        os.remove(stage_file)
+                
+                # Log iteration history as JSON
+                if "iteration_history" in intermediate and intermediate["iteration_history"]:
+                    history_file = f"{agent_type}_{task_id}_iteration_history.json"
+                    with open(history_file, "w", encoding="utf-8") as f:
+                        json.dump(intermediate["iteration_history"], f, ensure_ascii=False, indent=2)
+                    mlflow.log_artifact(history_file)
+                    os.remove(history_file)
+                    
+                    # Also log per-iteration drafts and critiques
+                    for iteration_data in intermediate["iteration_history"]:
+                        iter_num = iteration_data["iteration"]
+                        
+                        draft_file = f"{agent_type}_{task_id}_iteration_{iter_num}_draft.txt"
+                        with open(draft_file, "w", encoding="utf-8") as f:
+                            f.write(iteration_data.get("draft", ""))
+                        mlflow.log_artifact(draft_file)
+                        os.remove(draft_file)
+                        
+                        critique_file = f"{agent_type}_{task_id}_iteration_{iter_num}_critique.txt"
+                        with open(critique_file, "w", encoding="utf-8") as f:
+                            f.write(iteration_data.get("critique", ""))
+                        mlflow.log_artifact(critique_file)
+                        os.remove(critique_file)
             
-            print(f"\nMetrics Summary:")
+            print("\nMetrics Summary:")
             print(f"  Latency: {metrics['latency_seconds']:.2f}s")
             print(f"  Total Tokens: {metrics['total_tokens']}")
             print(f"  API Calls: {metrics['num_api_calls']}")
             print(f"  Estimated Cost: ${estimated_cost:.4f}")
-            print(f"\nJudge Scores:")
+            if agent_type == "ensemble":
+                print(f"  Iterations: {metrics.get('num_iterations', 0)}")
+            print("\nJudge Scores:")
             for criterion, score in judge_scores.items():
                 print(f"  {criterion.capitalize()}: {score}/5")
-            print(f"\nNLP Metrics:")
+            print("\nNLP Metrics:")
             for metric_name, metric_value in nlp_metrics.items():
                 print(f"  {metric_name}: {metric_value:.4f}")
 
@@ -327,11 +411,13 @@ def main():
     # Configuration
     doc_dir = "data/source_documents"
     task_file = "data/tasks/synthesis_tasks.json"
-    model = os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
-    judge_model = os.getenv("GEMINI_JUDGE_MODEL", model)
-    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-    rpm_limit = int(os.getenv("GEMINI_MAX_RPM", "4"))
-    rpd_limit = int(os.getenv("GEMINI_MAX_RPD", "15"))
+    model = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+    judge_model = os.getenv("JUDGE_MODEL", f"openai:/{model}")
+    crewai_model = os.getenv("CREWAI_MODEL", f"openai/{model}")
+
+    # Optional rate limiting for remote providers
+    rpm_limit = int(os.getenv("MAX_RPM", "0"))
+    rpd_limit = int(os.getenv("MAX_RPD", "0"))
     
     # Load data
     print("\nLoading source documents and tasks...")
@@ -343,29 +429,25 @@ def main():
     
     # Initialize MLflow
     mlflow.set_tracking_uri("file:./mlruns")
-    assert Version(mlflow.__version__) >= Version("2.18.0"), (
-        "This feature requires MLflow version 2.18.0 or newer. "
-        "Please upgrade mlflow to enable Gemini trace logging."
-    )
-    mlflow.gemini.autolog()
+    assert Version(mlflow.__version__) >= Version("3.1.0"), "Please upgrade mlflow to >= 3.1.0"
 
-    # Shared Gemini client and rate limiter across all calls
-    gemini_client = genai.Client(api_key=api_key)
-    rate_limiter = RequestRateLimiter(max_per_minute=rpm_limit, max_per_day=rpd_limit)
+    rate_limiter = None
+    if rpm_limit > 0 and rpd_limit > 0:
+        rate_limiter = RequestRateLimiter(max_per_minute=rpm_limit, max_per_day=rpd_limit)
     
     # Run monolithic agent experiments
     print("\n" + "="*60)
     print("MONOLITHIC AGENT EVALUATION")
     print("="*60)
-    monolithic_agent = MonolithicAgent(model=model, client=gemini_client, rate_limiter=rate_limiter)
-    run_experiment("monolithic", monolithic_agent, source_documents, tasks, judge_model, gemini_client, rate_limiter)
+    monolithic_agent = MonolithicAgent(model=model, rate_limiter=rate_limiter)
+    run_experiment("monolithic", monolithic_agent, source_documents, tasks, judge_model)
     
-    # Run ensemble agent experiments
+    # Run ensemble agent experiments (CrewAI Flow-based with recursive orchestration)
     print("\n" + "="*60)
-    print("ENSEMBLE AGENT EVALUATION")
+    print("ENSEMBLE AGENT EVALUATION (CrewAI Flows with Orchestrator)")
     print("="*60)
-    ensemble_agent = EnsembleAgent(model=model, client=gemini_client, rate_limiter=rate_limiter)
-    run_experiment("ensemble", ensemble_agent, source_documents, tasks, judge_model, gemini_client, rate_limiter)
+    ensemble_agent = EnsembleAgent(model=crewai_model, rate_limiter=rate_limiter)
+    run_experiment("ensemble", ensemble_agent, source_documents, tasks, judge_model)
     
     print("\n" + "="*60)
     print("EVALUATION COMPLETE")
