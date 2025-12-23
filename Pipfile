@@ -4,13 +4,15 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
-google-genai = ">=1.0.0"
 python-dotenv = ">=1.0.0"
 pydantic = ">=2.0.0"
 pypdf2 = ">=3.0.0"
 bert-score = ">=0.3.13"
 rouge-score = ">=0.1.2"
-mlflow = {extras = ["genai"], version = ">=2.18.0"}
+mlflow = {extras = ["genai"], version = ">=3.1.0"}
+openai = ">=1.0.0"
+crewai = ">=0.100.0"
+litellm = ">=1.0.0"
 
 [dev-packages]
 
