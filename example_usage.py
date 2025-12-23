@@ -6,7 +6,11 @@ Note: Defaults to local Ollama. Set LLM_PROVIDER=gemini to use Gemini.
 """
 
 import os
+import json
+from pathlib import Path
+from typing import List, Dict, Any
 from dotenv import load_dotenv
+from PyPDF2 import PdfReader
 from monolithic import MonolithicAgent
 from ensemble import EnsembleAgent
 
@@ -14,8 +18,44 @@ from ensemble import EnsembleAgent
 load_dotenv()
 
 
-def example_monolithic():
-    """Example usage of the monolithic agent."""
+def load_source_documents(doc_dir: str, pattern: str = "doc*.pdf") -> List[str]:
+    """Load source documents (PDF or text) from the specified directory.
+    
+    Args:
+        doc_dir: Directory containing source documents
+        pattern: Glob pattern for filtering files (default: "doc*.pdf" for examples)
+    """
+    documents = []
+    doc_path = Path(doc_dir)
+    
+    # Load PDF files matching the pattern
+    for filepath in sorted(doc_path.glob(pattern)):
+        if filepath.suffix.lower() == '.pdf':
+            reader = PdfReader(filepath)
+            text = ""
+            for page in reader.pages:
+                text += page.extract_text() + "\n"
+            documents.append(text.strip())
+        elif filepath.suffix.lower() == '.txt':
+            with open(filepath, "r", encoding="utf-8") as f:
+                documents.append(f.read())
+    
+    return documents
+
+
+def load_tasks(task_file: str) -> List[Dict[str, Any]]:
+    """Load synthesis tasks from JSON file."""
+    with open(task_file, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def example_monolithic(documents: List[str], task: str):
+    """Example usage of the monolithic agent.
+    
+    Args:
+        documents: List of source documents to synthesize
+        task: Task description for synthesis
+    """
     print("="*60)
     print("MONOLITHIC AGENT EXAMPLE")
     print("="*60)
@@ -23,20 +63,9 @@ def example_monolithic():
     # Initialize agent
     agent = MonolithicAgent()
     
-    # Sample documents
-    documents = [
-        """Machine learning is a subset of AI that enables systems to learn from data.
-        It includes supervised learning, unsupervised learning, and reinforcement learning.""",
-        
-        """Deep learning uses neural networks with multiple layers to process complex patterns.
-        It has revolutionized computer vision and natural language processing."""
-    ]
-    
-    # Synthesis task
-    task = "Write a brief summary of machine learning and deep learning."
-    
     # Run synthesis
-    print("\nSynthesizing documents...")
+    print(f"\nSynthesizing {len(documents)} documents...")
+    print(f"Task: {task[:80]}..." if len(task) > 80 else f"Task: {task}")
     result = agent.synthesize(documents, task)
     
     # Display results
@@ -51,8 +80,13 @@ def example_monolithic():
         print(f"  {key}: {value}")
 
 
-def example_ensemble():
-    """Example usage of the ensemble agent."""
+def example_ensemble(documents: List[str], task: str):
+    """Example usage of the ensemble agent.
+    
+    Args:
+        documents: List of source documents to synthesize
+        task: Task description for synthesis
+    """
     print("\n" + "="*60)
     print("ENSEMBLE AGENT EXAMPLE")
     print("="*60)
@@ -60,20 +94,9 @@ def example_ensemble():
     # Initialize agent
     agent = EnsembleAgent()
     
-    # Sample documents
-    documents = [
-        """Machine learning is a subset of AI that enables systems to learn from data.
-        It includes supervised learning, unsupervised learning, and reinforcement learning.""",
-        
-        """Deep learning uses neural networks with multiple layers to process complex patterns.
-        It has revolutionized computer vision and natural language processing."""
-    ]
-    
-    # Synthesis task
-    task = "Write a brief summary of machine learning and deep learning."
-    
     # Run synthesis
-    print("\nSynthesizing documents with ensemble (3 agents)...")
+    print(f"\nSynthesizing {len(documents)} documents with ensemble (3 agents)...")
+    print(f"Task: {task[:80]}..." if len(task) > 80 else f"Task: {task}")
     result = agent.synthesize(documents, task)
     
     # Display results
@@ -124,12 +147,33 @@ def main():
         print("\nSkipping examples (missing required configuration)")
         return
     
+    # Configuration for test/example runs
+    doc_dir = "data/source_documents"
+    task_file = "data/tasks/example_tasks.json"
+    doc_pattern = "doc*.pdf"  # Use doc*.pdf for examples/testing
+    
     try:
-        # Run monolithic example
-        example_monolithic()
+        # Load documents and tasks
+        print("\nLoading example documents and tasks...")
+        documents = load_source_documents(doc_dir, pattern=doc_pattern)
+        tasks = load_tasks(task_file)
         
-        # Run ensemble example
-        example_ensemble()
+        print(f"Loaded {len(documents)} example documents")
+        print(f"Loaded {len(tasks)} example tasks")
+        
+        # Run examples with first task
+        if tasks:
+            first_task = tasks[0]
+            task_description = first_task["task_description"]
+            
+            # Run monolithic example
+            example_monolithic(documents, task_description)
+            
+            # Run ensemble example
+            example_ensemble(documents, task_description)
+        else:
+            print("\n⚠️  No tasks found in example_tasks.json")
+            return
         
         print("\n" + "="*60)
         print("Examples completed successfully!")
@@ -138,8 +182,10 @@ def main():
     except Exception as e:
         print(f"\n❌ Error running examples: {e}")
         print("\nMake sure you have:")
-        print("  1. Valid Google Gemini API key in .env")
+        print("  1. Valid configuration in .env (or using Ollama locally)")
         print("  2. Installed all requirements: pip install -r requirements.txt")
+        print("  3. Example documents (doc*.pdf) in data/source_documents/")
+        print("  4. Example tasks in data/tasks/example_tasks.json")
 
 
 if __name__ == "__main__":

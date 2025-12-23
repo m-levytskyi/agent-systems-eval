@@ -21,23 +21,27 @@ from ensemble import EnsembleAgent
 load_dotenv()
 
 
-def load_source_documents(doc_dir: str) -> List[str]:
-    """Load all source documents (PDF or text) from the specified directory."""
+def load_source_documents(doc_dir: str, pattern: str = "*.pdf") -> List[str]:
+    """Load all source documents (PDF or text) from the specified directory.
+    
+    Args:
+        doc_dir: Directory containing source documents
+        pattern: Glob pattern for filtering files (default: "*.pdf")
+    """
     documents = []
     doc_path = Path(doc_dir)
     
-    # Load PDF files
-    for filepath in sorted(doc_path.glob("*.pdf")):
-        reader = PdfReader(filepath)
-        text = ""
-        for page in reader.pages:
-            text += page.extract_text() + "\n"
-        documents.append(text.strip())
-    
-    # Load text files (if any)
-    for filepath in sorted(doc_path.glob("*.txt")):
-        with open(filepath, "r", encoding="utf-8") as f:
-            documents.append(f.read())
+    # Load PDF files matching the pattern
+    for filepath in sorted(doc_path.glob(pattern)):
+        if filepath.suffix.lower() == '.pdf':
+            reader = PdfReader(filepath)
+            text = ""
+            for page in reader.pages:
+                text += page.extract_text() + "\n"
+            documents.append(text.strip())
+        elif filepath.suffix.lower() == '.txt':
+            with open(filepath, "r", encoding="utf-8") as f:
+                documents.append(f.read())
     
     return documents
 
@@ -411,6 +415,7 @@ def main():
     # Configuration
     doc_dir = "data/source_documents"
     task_file = "data/tasks/synthesis_tasks.json"
+    doc_pattern = "paper_*.pdf"  # Use paper_*.pdf for evaluation
     model = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
     judge_model = os.getenv("JUDGE_MODEL", f"openai:/{model}")
     crewai_model = os.getenv("CREWAI_MODEL", f"openai/{model}")
@@ -421,7 +426,7 @@ def main():
     
     # Load data
     print("\nLoading source documents and tasks...")
-    source_documents = load_source_documents(doc_dir)
+    source_documents = load_source_documents(doc_dir, pattern=doc_pattern)
     tasks = load_tasks(task_file)
     
     print(f"Loaded {len(source_documents)} source documents")
