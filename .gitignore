@@ -25,6 +25,7 @@ venv/
 ENV/
 env/
 agents_env/
+.venv/
 
 # MLflow
 mlruns/
