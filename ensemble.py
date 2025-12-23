@@ -1,46 +1,59 @@
 """
-Ensemble Agent: Multi-agent system for document synthesis.
+Ensemble Agent: CrewAI-based multi-agent system with recursive orchestration.
 
-This module implements a three-agent ensemble with distinct roles:
-- Archivist: Extracts and organizes key information from source documents
-- Drafter: Creates initial synthesis based on archivist's organization
-- Critic: Reviews and refines the draft for quality and completeness
+This module implements a four-agent ensemble using CrewAI Flows:
+- Archivist: Extracts and organizes key information from source documents (runs once)
+- Drafter: Creates synthesis based on archivist's organization (iterative)
+- Critic: Reviews and provides feedback on the draft (iterative)
+- Orchestrator: Decides whether to iterate or finalize (recursive control)
+
+The workflow uses CrewAI Flows API for recursive orchestration:
+Archivist → [Drafter → Critic → Orchestrator] → (loop or finalize)
 """
 
+from __future__ import annotations
+
+import json
 import os
 import time
-from typing import List, Dict, Any, Optional
-from google import genai
-from google.genai import types
-from dotenv import load_dotenv
-from rate_limits import RequestRateLimiter
+from typing import Any, Dict, List, Optional
 
-load_dotenv()
+from rate_limits import RequestRateLimiter
 
 
 class EnsembleAgent:
-    """Multi-agent ensemble for document synthesis with specialized roles."""
+    """CrewAI Flow-based ensemble with recursive orchestration via Orchestrator agent.
     
+    This implementation uses CrewAI Flows to enable iterative refinement where:
+    1. Archivist runs once to organize source material
+    2. Drafter creates a synthesis
+    3. Critic provides feedback
+    4. Orchestrator decides: continue iterating or finalize
+    5. Loop continues until production-ready or limits reached (max 5 iterations, 30min timeout)
+    """
+
     def __init__(
         self,
-        model: str = None,
-        api_key: str = None,
-        client: Optional[genai.Client] = None,
+        model: Optional[str] = None,
         rate_limiter: Optional[RequestRateLimiter] = None,
-    ):
+        max_iterations: int = 5,
+        timeout_seconds: float = 1800.0,  # 30 minutes
+    ) -> None:
         """
         Initialize the ensemble agent.
         
         Args:
-            model: Gemini model to use (defaults to env GEMINI_MODEL or gemini-2.5-pro)
-            api_key: Gemini API key (defaults to env GEMINI_API_KEY or GOOGLE_API_KEY)
+            model: CrewAI model identifier (defaults to env CREWAI_MODEL or openai/qwen2.5:7b)
+            rate_limiter: Optional rate limiter for API calls
+            max_iterations: Maximum number of draft-critique-orchestrator iterations
+            timeout_seconds: Maximum total time for synthesis (default 30 minutes)
         """
-        self.model = model or os.getenv("GEMINI_MODEL", "gemini-2.5-pro")
-        api_key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-        self.client = client or genai.Client(api_key=api_key)
+        self.model = model or os.getenv("CREWAI_MODEL", "openai/qwen2.5:7b")
         self.rate_limiter = rate_limiter
-        self.max_output_tokens = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "4000"))
-        self.metrics = {
+        self.max_iterations = max_iterations
+        self.timeout_seconds = timeout_seconds
+        
+        self.metrics: Dict[str, Any] = {
             "total_tokens": 0,
             "prompt_tokens": 0,
             "completion_tokens": 0,
@@ -48,212 +61,380 @@ class EnsembleAgent:
             "num_api_calls": 0,
             "archivist_tokens": 0,
             "drafter_tokens": 0,
-            "critic_tokens": 0
+            "critic_tokens": 0,
+            "orchestrator_tokens": 0,
+            "num_iterations": 0,
         }
-    
-    def _call_llm(self, system_prompt: str, user_prompt: str, role: str) -> str:
-        """
-        Make an LLM API call and track metrics.
-        
-        Args:
-            system_prompt: System prompt for the LLM
-            user_prompt: User prompt for the LLM
-            role: Name of the agent role (for metric tracking)
-            
-        Returns:
-            LLM response content
-        """
-        full_prompt = f"""{system_prompt}
 
-{user_prompt}"""
-        
-        response, text = self._generate_with_retry(full_prompt, role)
-        return text
-
-    def _generate_with_retry(self, contents: str, role: str, attempts: int = 2, backoff: float = 1.0):
-        """Generate content with retry to avoid empty responses and log finish reasons."""
-        last_response = None
-        for attempt in range(1, attempts + 1):
-            if self.rate_limiter:
-                self.rate_limiter.acquire()
-
-            response = self.client.models.generate_content(
-                model=self.model,
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    temperature=0.7,
-                    max_output_tokens=self.max_output_tokens
-                )
-            )
-
-            self.metrics["num_api_calls"] += 1
-            usage = getattr(response, "usage_metadata", None)
-            if usage:
-                prompt_tokens = getattr(usage, "input_tokens", getattr(usage, "prompt_token_count", 0)) or 0
-                completion_tokens = getattr(usage, "output_tokens", getattr(usage, "candidates_token_count", 0)) or 0
-                total_tokens = getattr(usage, "total_tokens", getattr(usage, "total_token_count", prompt_tokens + completion_tokens)) or 0
-                self.metrics["prompt_tokens"] += prompt_tokens
-                self.metrics["completion_tokens"] += completion_tokens
-                self.metrics["total_tokens"] += total_tokens
-                self.metrics[f"{role}_tokens"] += total_tokens
-
-            text = response.text or ""
-            if text.strip():
-                return response, text
-
-            finish_reason = None
-            if getattr(response, "candidates", None):
-                finish_reason = getattr(response.candidates[0], "finish_reason", None)
-            feedback = getattr(response, "prompt_feedback", None)
-            print(f"⚠️  Empty {role} response (attempt {attempt}/{attempts}); finish_reason={finish_reason}, feedback={feedback}")
-
-            last_response = response
-            if attempt < attempts:
-                time.sleep(backoff)
-        return last_response or response, text
-    
-    def archivist(self, source_documents: List[str], task_description: str) -> str:
-        """
-        Archivist agent: Extract and organize key information from documents.
-        
-        Args:
-            source_documents: List of source document contents
-            task_description: Description of the synthesis task
-            
-        Returns:
-            Structured summary of key information
-        """
-        documents_text = "\n\n".join([
-            f"DOCUMENT {i+1}:\n{doc}" 
-            for i, doc in enumerate(source_documents)
-        ])
-        
-        system_prompt = """You are an expert archivist. Your role is to read multiple documents and extract, categorize, and organize the most relevant information for a given task.
-
-Your responsibilities:
-- Identify key concepts, facts, and themes from each document
-- Organize information by topic and relevance to the task
-- Note any contradictions or complementary information across documents
-- Create a structured knowledge base for the drafter to use
-
-Output Format:
-Provide a clear, organized summary with sections for:
-1. Key Topics and Themes
-2. Important Facts and Details
-3. Cross-document Connections
-4. Relevant Context for the Task"""
-
-        user_prompt = f"""Task: {task_description}
-
-Source Documents:
-{documents_text}
-
-Please extract and organize the key information from these documents that is relevant to the task."""
-
-        return self._call_llm(system_prompt, user_prompt, "archivist")
-    
-    def drafter(self, archived_info: str, task_description: str) -> str:
-        """
-        Drafter agent: Create initial synthesis from organized information.
-        
-        Args:
-            archived_info: Organized information from the archivist
-            task_description: Description of the synthesis task
-            
-        Returns:
-            Initial draft of the synthesis
-        """
-        system_prompt = """You are an expert writer and synthesizer. Your role is to create a comprehensive, well-structured document based on organized information provided by the archivist.
-
-Your responsibilities:
-- Transform the archived information into a coherent narrative
-- Ensure logical flow and structure
-- Address all aspects of the task requirements
-- Write clearly and professionally
-- Integrate information naturally without simply listing facts
-
-Focus on creating a draft that is complete and well-organized, ready for review."""
-
-        user_prompt = f"""Task: {task_description}
-
-Organized Information from Archivist:
-{archived_info}
-
-Please create a comprehensive synthesis that addresses the task using the organized information above."""
-
-        return self._call_llm(system_prompt, user_prompt, "drafter")
-    
-    def critic(self, draft: str, task_description: str, archived_info: str) -> str:
-        """
-        Critic agent: Review and refine the draft for quality and completeness.
-        
-        Args:
-            draft: Initial draft from the drafter
-            task_description: Description of the synthesis task
-            archived_info: Original archived information for reference
-            
-        Returns:
-            Final refined synthesis
-        """
-        system_prompt = """You are an expert editor and critic. Your role is to review and refine drafts to ensure they meet the highest quality standards.
-
-Your responsibilities:
-- Check for completeness against task requirements
-- Ensure logical flow and coherence
-- Improve clarity and conciseness
-- Verify accuracy against source information
-- Enhance overall quality and professionalism
-- Fix any errors or weaknesses
-
-Provide a refined, polished version of the document."""
-
-        user_prompt = f"""Task: {task_description}
-
-Draft to Review:
-{draft}
-
-Original Archived Information (for reference):
-{archived_info}
-
-Please review and refine the draft to ensure it fully addresses the task with high quality and completeness."""
-
-        return self._call_llm(system_prompt, user_prompt, "critic")
-    
     def synthesize(self, source_documents: List[str], task_description: str) -> Dict[str, Any]:
         """
-        Synthesize source documents using the three-agent ensemble.
+        Synthesize source documents using CrewAI Flow-based recursive orchestration.
         
         Args:
             source_documents: List of source document contents
             task_description: Description of the synthesis task
             
         Returns:
-            Dictionary containing the final synthesis and metadata
+            Dictionary containing the final synthesis, iteration history, and metadata
         """
+        # Lazy import so the rest of the repo runs without CrewAI installed.
+        from crewai import Agent, Crew, LLM, Process, Task
+        from crewai.flow.flow import Flow, listen, router, start
+
         start_time = time.time()
-        
-        # Step 1: Archivist extracts and organizes information
-        archived_info = self.archivist(source_documents, task_description)
-        
-        # Step 2: Drafter creates initial synthesis
-        draft = self.drafter(archived_info, task_description)
-        
-        # Step 3: Critic reviews and refines
-        final_output = self.critic(draft, task_description, archived_info)
-        
-        end_time = time.time()
-        self.metrics["latency_seconds"] = end_time - start_time
-        
+        documents_text = "\n\n".join([f"DOCUMENT {i+1}:\n{doc}" for i, doc in enumerate(source_documents)])
+
+        # Configure CrewAI LLM
+        llm = LLM(model=self.model)
+
+        # Define agents
+        archivist_agent = Agent(
+            role="Archivist",
+            goal="Extract and organize relevant information from the provided documents for the given task.",
+            backstory="You are an expert archivist who creates structured knowledge bases from raw documents.",
+            allow_delegation=False,
+            verbose=False,
+            llm=llm,
+        )
+
+        drafter_agent = Agent(
+            role="Drafter",
+            goal="Write a comprehensive synthesis using the archivist's organized notes and any feedback from previous iterations.",
+            backstory="You are an expert technical writer focused on clarity and structure. You incorporate feedback to improve your drafts.",
+            allow_delegation=False,
+            verbose=False,
+            llm=llm,
+        )
+
+        critic_agent = Agent(
+            role="Critic",
+            goal="Provide detailed, actionable feedback on the draft to improve completeness, coherence, and quality.",
+            backstory="You are a meticulous editor who identifies specific improvements needed in drafts. Focus on actionable suggestions.",
+            allow_delegation=False,
+            verbose=False,
+            llm=llm,
+        )
+
+        orchestrator_agent = Agent(
+            role="Orchestrator",
+            goal="Evaluate critic feedback and decide if the draft is production-ready or needs another iteration.",
+            backstory=(
+                "You are an expert quality coordinator who makes strategic decisions about document readiness. "
+                "You consider whether the critic's feedback identifies substantial issues that would significantly "
+                "improve the output if addressed. Minor suggestions don't warrant iteration. "
+                "Examples of production-ready: minor wording tweaks, optional enhancements, already comprehensive. "
+                "Examples of needs-revision: missing key information, structural problems, factual errors, unclear sections."
+            ),
+            allow_delegation=False,
+            verbose=False,
+            llm=llm,
+        )
+
+        # State for the flow
+        class SynthesisFlowState:
+            def __init__(self):
+                self.archived_info = ""
+                self.current_draft = ""
+                self.current_critique = ""
+                self.iteration_history = []
+                self.num_iterations = 0
+                self.start_time = start_time
+                self.is_production_ready = False
+                self.orchestrator_decision = {}
+
+        state = SynthesisFlowState()
+
+        # Define the CrewAI Flow
+        class SynthesisFlow(Flow):
+            """Recursive synthesis flow with orchestrator-controlled iterations."""
+
+            @start()
+            def run_archivist(self):
+                """Step 1: Archivist runs once to organize source material."""
+                if self.rate_limiter:
+                    self.rate_limiter.acquire()
+
+                archivist_task = Task(
+                    description=(
+                        f"Task: {task_description}\n\n"
+                        f"Source Documents:\n{documents_text}\n\n"
+                        "Extract and organize key information relevant to the task. "
+                        "Provide sections: Key Topics and Themes; Important Facts and Details; "
+                        "Cross-document Connections; Relevant Context for the Task."
+                    ),
+                    agent=archivist_agent,
+                    expected_output="Structured summary with key topics, facts, connections, and context organized clearly.",
+                )
+
+                crew = Crew(
+                    agents=[archivist_agent],
+                    tasks=[archivist_task],
+                    process=Process.sequential,
+                    verbose=False,
+                )
+
+                result = crew.kickoff()
+                state.archived_info = self._extract_output(result)
+                
+                # Update metrics
+                self._update_metrics(result, "archivist")
+                
+                return state.archived_info
+
+            @listen(run_archivist)
+            def run_drafter(self, archived_info: str):
+                """Step 2: Drafter creates synthesis (receives feedback from orchestrator if iterating)."""
+                if self.rate_limiter:
+                    self.rate_limiter.acquire()
+
+                # Check timeout
+                if time.time() - state.start_time > self.timeout_seconds:
+                    print(f"⚠️  Timeout reached after {state.num_iterations} iterations")
+                    state.is_production_ready = True
+                    return state.current_draft or "Timeout: synthesis incomplete"
+
+                # Build drafter prompt with feedback if this is an iteration
+                if state.num_iterations > 0 and state.orchestrator_decision.get("actionable_improvements"):
+                    feedback_section = (
+                        f"\n\nPREVIOUS DRAFT:\n{state.current_draft}\n\n"
+                        f"CRITIC FEEDBACK:\n{state.current_critique}\n\n"
+                        f"ACTIONABLE IMPROVEMENTS TO ADDRESS:\n" +
+                        "\n".join([f"- {item}" for item in state.orchestrator_decision.get("actionable_improvements", [])])
+                    )
+                    drafter_description = (
+                        f"Task: {task_description}\n\n"
+                        f"Organized Information from Archivist:\n{archived_info}\n\n"
+                        f"{feedback_section}\n\n"
+                        "Revise the draft to address the actionable improvements while maintaining quality."
+                    )
+                else:
+                    drafter_description = (
+                        f"Task: {task_description}\n\n"
+                        f"Organized Information from Archivist:\n{archived_info}\n\n"
+                        "Create a comprehensive, well-structured synthesis that addresses the task."
+                    )
+
+                drafter_task = Task(
+                    description=drafter_description,
+                    agent=drafter_agent,
+                    expected_output="A comprehensive, well-structured synthesis document.",
+                )
+
+                crew = Crew(
+                    agents=[drafter_agent],
+                    tasks=[drafter_task],
+                    process=Process.sequential,
+                    verbose=False,
+                )
+
+                result = crew.kickoff()
+                state.current_draft = self._extract_output(result)
+                
+                # Update metrics
+                self._update_metrics(result, "drafter")
+                
+                return state.current_draft
+
+            @listen(run_drafter)
+            def run_critic(self, draft: str):
+                """Step 3: Critic provides detailed feedback on the draft."""
+                if self.rate_limiter:
+                    self.rate_limiter.acquire()
+
+                critic_task = Task(
+                    description=(
+                        f"Task: {task_description}\n\n"
+                        f"Draft to Review:\n{draft}\n\n"
+                        f"Original Archived Information (for reference):\n{state.archived_info}\n\n"
+                        "Provide detailed, actionable feedback on:\n"
+                        "1. Completeness: Does it fully address the task requirements?\n"
+                        "2. Coherence: Is it well-structured and logically flowing?\n"
+                        "3. Accuracy: Is information correctly integrated from sources?\n"
+                        "4. Quality: Is it professional and well-written?\n\n"
+                        "For each area, identify specific issues and suggest concrete improvements."
+                    ),
+                    agent=critic_agent,
+                    expected_output="Detailed critique with specific feedback on completeness, coherence, accuracy, and quality.",
+                )
+
+                crew = Crew(
+                    agents=[critic_agent],
+                    tasks=[critic_task],
+                    process=Process.sequential,
+                    verbose=False,
+                )
+
+                result = crew.kickoff()
+                state.current_critique = self._extract_output(result)
+                
+                # Update metrics
+                self._update_metrics(result, "critic")
+                
+                return state.current_critique
+
+            @listen(run_critic)
+            @router()
+            def orchestrator_decision(self, critique: str):
+                """Step 4: Orchestrator decides whether to iterate or finalize."""
+                if self.rate_limiter:
+                    self.rate_limiter.acquire()
+
+                state.num_iterations += 1
+
+                # Check iteration limit
+                if state.num_iterations >= self.max_iterations:
+                    print(f"⚠️  Max iterations ({self.max_iterations}) reached")
+                    state.is_production_ready = True
+                    self._record_iteration(final=True, reason="Max iterations reached")
+                    return "finalize"
+
+                # Check timeout
+                if time.time() - state.start_time > self.timeout_seconds:
+                    print(f"⚠️  Timeout reached after {state.num_iterations} iterations")
+                    state.is_production_ready = True
+                    self._record_iteration(final=True, reason="Timeout reached")
+                    return "finalize"
+
+                orchestrator_task = Task(
+                    description=(
+                        f"Task Requirements: {task_description}\n\n"
+                        f"Current Draft:\n{state.current_draft}\n\n"
+                        f"Critic Feedback:\n{critique}\n\n"
+                        "Evaluate whether this draft is production-ready or needs revision.\n\n"
+                        "Consider:\n"
+                        "- Are there SUBSTANTIAL issues that would significantly improve the output if fixed?\n"
+                        "- Does the critic identify missing key information, structural problems, or factual errors?\n"
+                        "- Or is the feedback mostly minor suggestions, optional enhancements, or polish?\n\n"
+                        "Return ONLY a valid JSON object with this exact structure:\n"
+                        "{\n"
+                        '  "is_production_ready": true or false,\n'
+                        '  "reason": "brief explanation of the decision",\n'
+                        '  "actionable_improvements": ["list", "of", "specific", "changes", "needed"] or []\n'
+                        "}\n\n"
+                        "If is_production_ready is true, actionable_improvements should be empty."
+                    ),
+                    agent=orchestrator_agent,
+                    expected_output="JSON object with is_production_ready, reason, and actionable_improvements fields.",
+                )
+
+                crew = Crew(
+                    agents=[orchestrator_agent],
+                    tasks=[orchestrator_task],
+                    process=Process.sequential,
+                    verbose=False,
+                )
+
+                result = crew.kickoff()
+                decision_text = self._extract_output(result)
+                
+                # Update metrics
+                self._update_metrics(result, "orchestrator")
+
+                # Parse JSON decision
+                try:
+                    # Extract JSON from potential markdown code blocks
+                    if "```json" in decision_text:
+                        decision_text = decision_text.split("```json")[1].split("```")[0].strip()
+                    elif "```" in decision_text:
+                        decision_text = decision_text.split("```")[1].split("```")[0].strip()
+                    
+                    decision = json.loads(decision_text)
+                    state.orchestrator_decision = decision
+                    is_ready = decision.get("is_production_ready", False)
+                    
+                    # Record this iteration
+                    self._record_iteration(
+                        final=is_ready,
+                        reason=decision.get("reason", ""),
+                        improvements=decision.get("actionable_improvements", [])
+                    )
+                    
+                    if is_ready:
+                        state.is_production_ready = True
+                        print(f"✓ Draft approved as production-ready after {state.num_iterations} iteration(s)")
+                        return "finalize"
+                    else:
+                        improvements = decision.get("actionable_improvements", [])
+                        print(f"⟳ Iteration {state.num_iterations}: Continuing with {len(improvements)} improvements")
+                        return "continue"
+                        
+                except (json.JSONDecodeError, KeyError, ValueError) as e:
+                    print(f"⚠️  Failed to parse orchestrator decision: {e}")
+                    print(f"Raw decision: {decision_text[:200]}")
+                    # Default to finalize on parse error to avoid infinite loops
+                    state.is_production_ready = True
+                    self._record_iteration(final=True, reason="Parse error in orchestrator decision")
+                    return "finalize"
+
+            @listen("continue")
+            def continue_iteration(self):
+                """Route back to drafter for another iteration."""
+                # Trigger drafter again with current state
+                return self.run_drafter(state.archived_info)
+
+            @listen("finalize")
+            def finalize_output(self):
+                """Return final output."""
+                return state.current_draft
+
+            def _extract_output(self, crew_result) -> str:
+                """Extract text output from CrewAI result."""
+                return (
+                    getattr(crew_result, "raw", None)
+                    or getattr(crew_result, "final_output", None)
+                    or str(crew_result)
+                )
+
+            def _update_metrics(self, crew_result, role: str):
+                """Update token metrics from crew result."""
+                usage = getattr(crew_result, "usage_metrics", None)
+                if usage:
+                    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                        if hasattr(usage, key):
+                            value = int(getattr(usage, key) or 0)
+                            self.metrics[key] += value
+                            if key == "total_tokens":
+                                self.metrics[f"{role}_tokens"] += value
+                self.metrics["num_api_calls"] += 1
+
+            def _record_iteration(self, final: bool, reason: str, improvements: Optional[List[str]] = None):
+                """Record iteration in history."""
+                state.iteration_history.append({
+                    "iteration": state.num_iterations,
+                    "draft": state.current_draft,
+                    "critique": state.current_critique,
+                    "decision": {
+                        "is_production_ready": final,
+                        "reason": reason,
+                        "actionable_improvements": improvements or []
+                    }
+                })
+
+        # Bind state and methods to flow instance
+        flow = SynthesisFlow()
+        flow.rate_limiter = self.rate_limiter
+        flow.timeout_seconds = self.timeout_seconds
+        flow.max_iterations = self.max_iterations
+        flow.metrics = self.metrics
+
+        # Execute the flow
+        final_output = flow.kickoff()
+
+        # Update final metrics
+        self.metrics["num_iterations"] = state.num_iterations
+        self.metrics["latency_seconds"] = time.time() - start_time
+
         return {
-            "output": final_output,
+            "output": final_output or state.current_draft or "",
             "intermediate_outputs": {
-                "archived_info": archived_info,
-                "draft": draft
+                "archived_info": state.archived_info,
+                "draft": state.current_draft,
+                "iteration_history": state.iteration_history,
             },
             "metrics": self.metrics.copy(),
-            "model": self.model
+            "model": self.model,
         }
-    
+
     def get_metrics(self) -> Dict[str, Any]:
         """Get current metrics."""
         return self.metrics.copy()
@@ -265,14 +446,22 @@ if __name__ == "__main__":
     
     # Load sample documents
     doc_dir = os.path.join(os.path.dirname(__file__), "data", "source_documents")
+    from PyPDF2 import PdfReader
+    from pathlib import Path
+    
     documents = []
-    for filename in sorted(os.listdir(doc_dir)):
-        if filename.endswith(".txt") or filename.endswith(".pdf"):
-            filepath = os.path.join(doc_dir, filename)
-            if filename.endswith(".txt"):
-                with open(filepath, "r") as f:
-                    documents.append(f.read())
-            # PDF loading will be handled by evaluate.py
+    doc_path = Path(doc_dir)
+    
+    for filepath in sorted(doc_path.glob("*.pdf")):
+        reader = PdfReader(filepath)
+        text = ""
+        for page in reader.pages:
+            text += page.extract_text() + "\n"
+        documents.append(text.strip())
+    
+    for filepath in sorted(doc_path.glob("*.txt")):
+        with open(filepath, "r", encoding="utf-8") as f:
+            documents.append(f.read())
     
     # Example synthesis task
     task = "Write a comprehensive executive summary about artificial intelligence"
@@ -282,3 +471,4 @@ if __name__ == "__main__":
     print(result["output"])
     print("\nMetrics:")
     print(result["metrics"])
+    print(f"\nIterations: {result['metrics']['num_iterations']}")
