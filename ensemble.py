@@ -181,9 +181,14 @@ class EnsembleAgent:
                 
                 return state.archived_info
 
+            @start("continue")
             @listen(run_archivist)
-            def run_drafter(self, archived_info: str):
+            def run_drafter(self, archived_info: str = None):
                 """Step 2: Drafter creates synthesis (receives feedback from orchestrator if iterating)."""
+                # Use archived_info from state if not provided (for retry iterations)
+                if archived_info is None:
+                    archived_info = state.archived_info
+                    
                 if self.rate_limiter:
                     self.rate_limiter.acquire()
 
@@ -273,7 +278,7 @@ class EnsembleAgent:
                 return state.current_critique
 
             @listen(run_critic)
-            @router()
+            @router(run_critic)
             def orchestrator_decision(self, critique: str):
                 """Step 4: Orchestrator decides whether to iterate or finalize."""
                 if self.rate_limiter:
@@ -365,12 +370,6 @@ class EnsembleAgent:
                     state.is_production_ready = True
                     self._record_iteration(final=True, reason="Parse error in orchestrator decision")
                     return "finalize"
-
-            @listen("continue")
-            def continue_iteration(self):
-                """Route back to drafter for another iteration."""
-                # Trigger drafter again with current state
-                return self.run_drafter(state.archived_info)
 
             @listen("finalize")
             def finalize_output(self):
