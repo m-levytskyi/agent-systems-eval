@@ -1,14 +1,14 @@
 """
-Ensemble Agent: CrewAI-based multi-agent system with recursive orchestration.
+Ensemble Agent: CrewAI-based multi-agent system with recursive orchestration and Map-Reduce.
 
 This module implements a four-agent ensemble using CrewAI Flows:
-- Archivist: Extracts and organizes key information from source documents (runs once)
+- Archivist: Extracts and organizes key information from source documents (runs once with map-reduce)
 - Drafter: Creates synthesis based on archivist's organization (iterative)
 - Critic: Reviews and provides feedback on the draft (iterative)
 - Orchestrator: Decides whether to iterate or finalize (recursive control)
 
 The workflow uses CrewAI Flows API for recursive orchestration:
-Archivist → [Drafter → Critic → Orchestrator] → (loop or finalize)
+Archivist (map-reduce) → [Drafter → Critic → Orchestrator] → (loop or finalize)
 """
 
 from __future__ import annotations
@@ -16,10 +16,13 @@ from __future__ import annotations
 import json
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
 
 from rate_limits import RequestRateLimiter
+from utils import setup_logging, sanitize_document, chunk_document, estimate_tokens
 
+logger = setup_logging("ensemble_agent")
 
 class EnsembleAgent:
     """CrewAI Flow-based ensemble with recursive orchestration via Orchestrator agent.
@@ -64,7 +67,189 @@ class EnsembleAgent:
             "critic_tokens": 0,
             "orchestrator_tokens": 0,
             "num_iterations": 0,
+            "document_summaries_tokens": 0,
+            "num_documents_summarized": 0,
         }
+
+    def _preprocess_documents_for_archivist(
+        self,
+        source_documents: List[str],
+        llm,
+        cache_dir: str = "data/cache/ensemble_summaries",
+    ) -> Tuple[List[str], List[Dict[str, Any]]]:
+        """
+        Map phase for Archivist: Summarize each document individually.
+        Uses caching to allow restart on interruption.
+        
+        Args:
+            source_documents: List of raw source documents
+            llm: CrewAI LLM instance
+            cache_dir: Directory to store cached summaries
+            
+        Returns:
+            Tuple of (summaries, summary_metadata)
+        """
+        from crewai import Agent, Crew, Process, Task
+        
+        # Create cache directory
+        cache_path = Path(cache_dir)
+        cache_path.mkdir(parents=True, exist_ok=True)
+        
+        summaries = []
+        summary_metadata = []
+        
+        logger.info(f"{'='*60}")
+        logger.info(f"ARCHIVIST MAP PHASE: Summarizing {len(source_documents)} documents")
+        logger.info(f"Cache directory: {cache_dir}")
+        logger.info(f"{'='*60}")
+        
+        # Create a temporary agent for summarization
+        summarizer_agent = Agent(
+            role="Document Summarizer",
+            goal="Create comprehensive summaries of academic documents preserving all critical information.",
+            backstory="You are an expert at extracting and preserving key information from academic papers.",
+            allow_delegation=False,
+            verbose=True,
+            llm=llm,
+        )
+        
+        for doc_idx, doc in enumerate(source_documents, start=1):
+            # Check cache first
+            cache_file = cache_path / f"doc_{doc_idx}_summary.json"
+            
+            if cache_file.exists():
+                logger.info(f"Document {doc_idx}/{len(source_documents)}: Loading from cache...")
+                with open(cache_file, 'r') as f:
+                    cached = json.load(f)
+                    summaries.append(cached['summary'])
+                    summary_metadata.append(cached['metadata'])
+                    # Update metrics from cache
+                    self.metrics["num_api_calls"] += cached['metadata'].get('num_api_calls', 0)
+                    self.metrics["document_summaries_tokens"] += cached['metadata']['tokens_used']
+                    
+                    # Also update global token counts if available in metadata or estimate
+                    tokens_used = cached['metadata']['tokens_used']
+                    self.metrics["total_tokens"] += tokens_used
+                    # Assume mostly prompt tokens for summarization (reading large doc)
+                    # This is an approximation if exact split isn't saved
+                    self.metrics["prompt_tokens"] += int(tokens_used * 0.8)
+                    self.metrics["completion_tokens"] += int(tokens_used * 0.2)
+                continue
+            
+            logger.info(f"Processing Document {doc_idx}/{len(source_documents)}...")
+            
+            # Sanitize
+            sanitized_doc = sanitize_document(doc)
+            original_tokens = estimate_tokens(doc)
+            sanitized_tokens = estimate_tokens(sanitized_doc)
+            tokens_saved = original_tokens - sanitized_tokens
+            
+            logger.info(f"  Original: ~{original_tokens:,} tokens")
+            logger.info(f"  Sanitized: ~{sanitized_tokens:,} tokens (saved ~{tokens_saved:,})")
+            
+            # Chunk if necessary
+            chunks = chunk_document(sanitized_doc, max_tokens=16000)
+            logger.info(f"  Chunks: {len(chunks)}")
+            
+            # Summarize each chunk
+            chunk_summaries = []
+            chunk_metrics = []
+            
+            for chunk_idx, chunk in enumerate(chunks, start=1):
+                chunk_tokens = estimate_tokens(chunk)
+                logger.info(f"    Chunk {chunk_idx}/{len(chunks)}: ~{chunk_tokens:,} tokens")
+                
+                if self.rate_limiter:
+                    self.rate_limiter.acquire()
+                
+                if len(chunks) > 1:
+                    description = f"""This is CHUNK {chunk_idx} of {len(chunks)} from DOCUMENT {doc_idx}.
+
+Document Chunk:
+{chunk}
+
+Provide a comprehensive summary preserving all critical information, research questions, methodology, findings, and technical details."""
+                else:
+                    description = f"""This is DOCUMENT {doc_idx}.
+
+Document:
+{chunk}
+
+Provide a comprehensive summary preserving all critical information, research questions, methodology, findings, and technical details."""
+                
+                task = Task(
+                    description=description,
+                    agent=summarizer_agent,
+                    expected_output="Comprehensive summary with all critical information preserved.",
+                )
+                
+                crew = Crew(
+                    agents=[summarizer_agent],
+                    tasks=[task],
+                    process=Process.sequential,
+                    verbose=True,
+                )
+                
+                result = crew.kickoff()
+                summary = self._extract_output(result)
+                
+                # Track metrics
+                usage = getattr(result, "usage_metrics", None)
+                metrics = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+                if usage:
+                    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                        if hasattr(usage, key):
+                            metrics[key] = int(getattr(usage, key) or 0)
+                
+                chunk_summaries.append(summary)
+                chunk_metrics.append(metrics)
+                
+                # Update global metrics
+                self.metrics["num_api_calls"] += 1
+                self.metrics["prompt_tokens"] += metrics["prompt_tokens"]
+                self.metrics["completion_tokens"] += metrics["completion_tokens"]
+                self.metrics["total_tokens"] += metrics["total_tokens"]
+                self.metrics["document_summaries_tokens"] += metrics["total_tokens"]
+            
+            # Combine chunks
+            if len(chunks) > 1:
+                combined_summary = f"DOCUMENT {doc_idx} (multi-part summary):\n\n" + "\n\n---\n\n".join(chunk_summaries)
+            else:
+                combined_summary = f"DOCUMENT {doc_idx}:\n\n{chunk_summaries[0]}"
+            
+            summaries.append(combined_summary)
+            metadata = {
+                "doc_index": doc_idx,
+                "original_length": len(doc),
+                "sanitized_length": len(sanitized_doc),
+                "num_chunks": len(chunks),
+                "summary_length": len(combined_summary),
+                "tokens_used": sum(m["total_tokens"] for m in chunk_metrics),
+                "num_api_calls": len(chunks),
+            }
+            summary_metadata.append(metadata)
+            
+            # Save checkpoint
+            with open(cache_file, 'w') as f:
+                json.dump({
+                    'summary': combined_summary,
+                    'metadata': metadata
+                }, f, indent=2)
+            
+            logger.info(f"  Summary: {len(combined_summary)} chars, {sum(m['total_tokens'] for m in chunk_metrics)} tokens")
+            logger.info(f"  ✓ Checkpoint saved to {cache_file}")
+        
+        self.metrics["num_documents_summarized"] = len(source_documents)
+        
+        return summaries, summary_metadata
+    
+    def _extract_output(self, crew_result) -> str:
+        """Extract text output from CrewAI result."""
+        return (
+            getattr(crew_result, "raw", None)
+            or getattr(crew_result, "final_output", None)
+            or str(crew_result)
+        )
 
     def synthesize(self, source_documents: List[str], task_description: str) -> Dict[str, Any]:
         """
@@ -82,10 +267,13 @@ class EnsembleAgent:
         from crewai.flow.flow import Flow, listen, router, start
 
         start_time = time.time()
-        documents_text = "\n\n".join([f"DOCUMENT {i+1}:\n{doc}" for i, doc in enumerate(source_documents)])
-
+        
         # Configure CrewAI LLM
         llm = LLM(model=self.model)
+        
+        # Preprocess documents with map-reduce
+        document_summaries, summary_metadata = self._preprocess_documents_for_archivist(source_documents, llm)
+        documents_text = "\n\n".join(document_summaries)
 
         # Define agents
         archivist_agent = Agent(
@@ -93,7 +281,7 @@ class EnsembleAgent:
             goal="Extract and organize relevant information from the provided documents for the given task.",
             backstory="You are an expert archivist who creates structured knowledge bases from raw documents.",
             allow_delegation=False,
-            verbose=False,
+            verbose=True,
             llm=llm,
         )
 
@@ -102,7 +290,8 @@ class EnsembleAgent:
             goal="Write a comprehensive synthesis using the archivist's organized notes and any feedback from previous iterations.",
             backstory="You are an expert technical writer focused on clarity and structure. You incorporate feedback to improve your drafts.",
             allow_delegation=False,
-            verbose=False,
+            verbose=True,
+            cache=False,
             llm=llm,
         )
 
@@ -111,7 +300,8 @@ class EnsembleAgent:
             goal="Provide detailed, actionable feedback on the draft to improve completeness, coherence, and quality.",
             backstory="You are a meticulous editor who identifies specific improvements needed in drafts. Focus on actionable suggestions.",
             allow_delegation=False,
-            verbose=False,
+            verbose=True,
+            cache=False,
             llm=llm,
         )
 
@@ -126,7 +316,8 @@ class EnsembleAgent:
                 "Examples of needs-revision: missing key information, structural problems, factual errors, unclear sections."
             ),
             allow_delegation=False,
-            verbose=False,
+            verbose=True,
+            cache=False,
             llm=llm,
         )
 
@@ -141,6 +332,8 @@ class EnsembleAgent:
                 self.start_time = start_time
                 self.is_production_ready = False
                 self.orchestrator_decision = {}
+                self.document_summaries = document_summaries
+                self.summary_metadata = summary_metadata
 
         state = SynthesisFlowState()
 
@@ -150,14 +343,14 @@ class EnsembleAgent:
 
             @start()
             def run_archivist(self):
-                """Step 1: Archivist runs once to organize source material."""
+                """Step 1: Archivist organizes pre-processed document summaries."""
                 if self.rate_limiter:
                     self.rate_limiter.acquire()
 
                 archivist_task = Task(
                     description=(
                         f"Task: {task_description}\n\n"
-                        f"Source Documents:\n{documents_text}\n\n"
+                        f"Document Summaries (pre-processed from {len(state.document_summaries)} documents):\n{documents_text}\n\n"
                         "Extract and organize key information relevant to the task. "
                         "Provide sections: Key Topics and Themes; Important Facts and Details; "
                         "Cross-document Connections; Relevant Context for the Task."
@@ -170,7 +363,7 @@ class EnsembleAgent:
                     agents=[archivist_agent],
                     tasks=[archivist_task],
                     process=Process.sequential,
-                    verbose=False,
+                    verbose=True,
                 )
 
                 result = crew.kickoff()
@@ -181,12 +374,23 @@ class EnsembleAgent:
                 
                 return state.archived_info
 
-            @start("continue")
-            @listen(run_archivist)
-            def run_drafter(self, archived_info: str = None):
+            @router(run_archivist)
+            def route_to_drafter(self):
+                """Route from archivist to drafter."""
+                return "run_drafter"
+
+            @listen("run_drafter")
+            def run_drafter(self, archived_info_or_route: str = None):
                 """Step 2: Drafter creates synthesis (receives feedback from orchestrator if iterating)."""
-                # Use archived_info from state if not provided (for retry iterations)
-                if archived_info is None:
+                # Handle both initial call (archived_info) and iteration call (route string)
+                if archived_info_or_route == "continue":
+                    # This is a continue signal from orchestrator - use state
+                    archived_info = state.archived_info
+                elif archived_info_or_route:
+                    # This is the initial call with archived_info
+                    archived_info = archived_info_or_route
+                else:
+                    # Fallback to state
                     archived_info = state.archived_info
                     
                 if self.rate_limiter:
@@ -194,7 +398,7 @@ class EnsembleAgent:
 
                 # Check timeout
                 if time.time() - state.start_time > self.timeout_seconds:
-                    print(f"⚠️  Timeout reached after {state.num_iterations} iterations")
+                    logger.warning(f"⚠️  Timeout reached after {state.num_iterations} iterations")
                     state.is_production_ready = True
                     return state.current_draft or "Timeout: synthesis incomplete"
 
@@ -229,11 +433,20 @@ class EnsembleAgent:
                     agents=[drafter_agent],
                     tasks=[drafter_task],
                     process=Process.sequential,
-                    verbose=False,
+                    verbose=True,
                 )
 
                 result = crew.kickoff()
                 state.current_draft = self._extract_output(result)
+                
+                # Save draft to file
+                draft_dir = Path("data/drafts") / str(int(state.start_time))
+                draft_dir.mkdir(parents=True, exist_ok=True)
+                draft_file = draft_dir / f"draft_iteration_{state.num_iterations}.md"
+                print(f"DEBUG: Saving draft iteration {state.num_iterations} to {draft_file}")
+                with open(draft_file, "w", encoding="utf-8") as f:
+                    f.write(state.current_draft)
+                logger.info(f"Saved draft to {draft_file}")
                 
                 # Update metrics
                 self._update_metrics(result, "drafter")
@@ -266,7 +479,7 @@ class EnsembleAgent:
                     agents=[critic_agent],
                     tasks=[critic_task],
                     process=Process.sequential,
-                    verbose=False,
+                    verbose=True,
                 )
 
                 result = crew.kickoff()
@@ -278,8 +491,7 @@ class EnsembleAgent:
                 return state.current_critique
 
             @listen(run_critic)
-            @router(run_critic)
-            def orchestrator_decision(self, critique: str):
+            def run_orchestrator(self, critique: str):
                 """Step 4: Orchestrator decides whether to iterate or finalize."""
                 if self.rate_limiter:
                     self.rate_limiter.acquire()
@@ -288,17 +500,17 @@ class EnsembleAgent:
 
                 # Check iteration limit
                 if state.num_iterations >= self.max_iterations:
-                    print(f"⚠️  Max iterations ({self.max_iterations}) reached")
+                    logger.warning(f"⚠️  Max iterations ({self.max_iterations}) reached")
                     state.is_production_ready = True
                     self._record_iteration(final=True, reason="Max iterations reached")
-                    return "finalize"
+                    return
 
                 # Check timeout
                 if time.time() - state.start_time > self.timeout_seconds:
-                    print(f"⚠️  Timeout reached after {state.num_iterations} iterations")
+                    logger.warning(f"⚠️  Timeout reached after {state.num_iterations} iterations")
                     state.is_production_ready = True
                     self._record_iteration(final=True, reason="Timeout reached")
-                    return "finalize"
+                    return
 
                 orchestrator_task = Task(
                     description=(
@@ -326,7 +538,7 @@ class EnsembleAgent:
                     agents=[orchestrator_agent],
                     tasks=[orchestrator_task],
                     process=Process.sequential,
-                    verbose=False,
+                    verbose=True,
                 )
 
                 result = crew.kickoff()
@@ -356,20 +568,24 @@ class EnsembleAgent:
                     
                     if is_ready:
                         state.is_production_ready = True
-                        print(f"✓ Draft approved as production-ready after {state.num_iterations} iteration(s)")
-                        return "finalize"
+                        logger.info(f"✓ Draft approved as production-ready after {state.num_iterations} iteration(s)")
                     else:
                         improvements = decision.get("actionable_improvements", [])
-                        print(f"⟳ Iteration {state.num_iterations}: Continuing with {len(improvements)} improvements")
-                        return "continue"
+                        logger.info(f"⟳ Iteration {state.num_iterations}: Continuing with {len(improvements)} improvements")
                         
                 except (json.JSONDecodeError, KeyError, ValueError) as e:
-                    print(f"⚠️  Failed to parse orchestrator decision: {e}")
-                    print(f"Raw decision: {decision_text[:200]}")
+                    logger.warning(f"⚠️  Failed to parse orchestrator decision: {e}")
+                    logger.warning(f"Raw decision: {decision_text[:200]}")
                     # Default to finalize on parse error to avoid infinite loops
                     state.is_production_ready = True
                     self._record_iteration(final=True, reason="Parse error in orchestrator decision")
-                    return "finalize"
+
+            @router(run_orchestrator)
+            def route_after_orchestrator(self):
+                """Route based on orchestrator decision."""
+                if state.is_production_ready:
+                    return "finalize_output"
+                return "run_drafter"
 
             @listen("finalize")
             def finalize_output(self):
@@ -386,14 +602,44 @@ class EnsembleAgent:
 
             def _update_metrics(self, crew_result, role: str):
                 """Update token metrics from crew result."""
-                usage = getattr(crew_result, "usage_metrics", None)
+                # CrewAI's token usage tracking varies by version
+                # Try multiple common attribute locations
+                usage = None
+                
+                # Try direct attributes on crew_result
+                for attr in ["usage_metrics", "token_usage", "usage", "tokens"]:
+                    if hasattr(crew_result, attr):
+                        usage = getattr(crew_result, attr)
+                        if usage:
+                            break
+                
+                # If no usage found, try to get it from tasks
+                if not usage and hasattr(crew_result, "tasks_output"):
+                    tasks = crew_result.tasks_output
+                    if tasks and len(tasks) > 0:
+                        task_result = tasks[0] if isinstance(tasks, list) else tasks
+                        for attr in ["usage_metrics", "token_usage", "usage"]:
+                            if hasattr(task_result, attr):
+                                usage = getattr(task_result, attr)
+                                if usage:
+                                    break
+                
                 if usage:
-                    for key in ("prompt_tokens", "completion_tokens", "total_tokens"):
-                        if hasattr(usage, key):
-                            value = int(getattr(usage, key) or 0)
-                            self.metrics[key] += value
-                            if key == "total_tokens":
-                                self.metrics[f"{role}_tokens"] += value
+                    # Handle both dict and object attribute access
+                    def get_val(obj, key):
+                        if isinstance(obj, dict):
+                            return obj.get(key, 0) or 0
+                        return getattr(obj, key, 0) or 0
+                    
+                    prompt = get_val(usage, "prompt_tokens")
+                    completion = get_val(usage, "completion_tokens")
+                    total = get_val(usage, "total_tokens") or (prompt + completion)
+                    
+                    self.metrics["prompt_tokens"] += int(prompt)
+                    self.metrics["completion_tokens"] += int(completion)
+                    self.metrics["total_tokens"] += int(total)
+                    self.metrics[f"{role}_tokens"] += int(total)
+                
                 self.metrics["num_api_calls"] += 1
 
             def _record_iteration(self, final: bool, reason: str, improvements: Optional[List[str]] = None):
@@ -422,13 +668,35 @@ class EnsembleAgent:
         # Update final metrics
         self.metrics["num_iterations"] = state.num_iterations
         self.metrics["latency_seconds"] = time.time() - start_time
-
+        
+        # Ensure final refined draft is captured if iterations occurred
+        # If orchestrator approved after revisions, capture that final state
+        if state.num_iterations > 0 and state.is_production_ready:
+            # Check if we need to add a final iteration entry
+            last_iteration = state.iteration_history[-1] if state.iteration_history else None
+            if last_iteration and not last_iteration["decision"]["is_production_ready"]:
+                # The flow finalized but the last recorded iteration wasn't marked as final
+                # This can happen if finalize was triggered by timeout/max iterations
+                # Add a final entry capturing the approved state
+                state.iteration_history.append({
+                    "iteration": state.num_iterations,
+                    "draft": state.current_draft,
+                    "critique": state.current_critique,
+                    "decision": {
+                        "is_production_ready": True,
+                        "reason": "Flow completed",
+                        "actionable_improvements": []
+                    }
+                })
+        
         return {
             "output": final_output or state.current_draft or "",
             "intermediate_outputs": {
                 "archived_info": state.archived_info,
                 "draft": state.current_draft,
                 "iteration_history": state.iteration_history,
+                "document_summaries": state.document_summaries,
+                "summary_metadata": state.summary_metadata,
             },
             "metrics": self.metrics.copy(),
             "model": self.model,
@@ -466,8 +734,8 @@ if __name__ == "__main__":
     task = "Write a comprehensive executive summary about artificial intelligence"
     
     result = agent.synthesize(documents, task)
-    print("Final Synthesized Output:")
-    print(result["output"])
-    print("\nMetrics:")
-    print(result["metrics"])
-    print(f"\nIterations: {result['metrics']['num_iterations']}")
+    logger.info("Final Synthesized Output:")
+    logger.info(result["output"])
+    logger.info("\nMetrics:")
+    logger.info(result["metrics"])
+    logger.info(f"\nIterations: {result['metrics']['num_iterations']}")
