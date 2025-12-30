@@ -30,6 +30,7 @@ agents_env/
 # MLflow
 mlruns/
 mlartifacts/
+data/drafts/
 
 # Environment variables
 .env
@@ -44,3 +45,6 @@ mlartifacts/
 # OS
 .DS_Store
 Thumbs.db
+
+# Cache directories
+data/cache/
