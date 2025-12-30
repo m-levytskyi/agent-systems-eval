@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
 
@@ -20,10 +22,12 @@ class OllamaClient:
         base_url: Optional[str] = None,
         model: Optional[str] = None,
         timeout_seconds: float = 300.0,
+        num_ctx: int = 32768,
     ) -> None:
         self.base_url = (base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")).rstrip("/")
         self.model = model or os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
         self.timeout_seconds = timeout_seconds
+        self.num_ctx = int(os.getenv("OLLAMA_NUM_CTX", str(num_ctx)))
 
     def chat(
         self,
@@ -46,6 +50,7 @@ class OllamaClient:
             "options": {
                 "temperature": temperature,
                 "num_predict": max_tokens,
+                "num_ctx": self.num_ctx,
             },
         }
 
@@ -57,8 +62,15 @@ class OllamaClient:
             method="POST",
         )
 
-        with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
-            raw = json.loads(resp.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
+                raw = json.loads(resp.read().decode("utf-8"))
+        except (TimeoutError, socket.timeout, urllib.error.URLError, urllib.error.HTTPError) as exc:
+            raise RuntimeError(
+                "Could not reach Ollama at "
+                f"{self.base_url}. Ensure 'ollama serve' is running and the model "
+                f"'{self.model}' is pulled."
+            ) from exc
 
         message = (raw.get("message") or {})
         text = (message.get("content") or "")

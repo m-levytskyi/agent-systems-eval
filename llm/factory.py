@@ -22,6 +22,7 @@ def create_llm_client(*, provider: Optional[str] = None) -> LLMClient:
         return OllamaClient(
             base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
             model=os.getenv("OLLAMA_MODEL", "qwen2.5:7b"),
+            num_ctx=int(os.getenv("OLLAMA_NUM_CTX", "32768")),
         )
 
     if provider != "gemini":
