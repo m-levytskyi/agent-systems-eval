@@ -14,12 +14,16 @@ This project successfully implements an empirical comparison of two agent archit
 - Comprehensive metrics tracking (tokens, latency, cost)
 
 **Ensemble Agent (`ensemble.py`)**
-- Three-agent architecture with specialized roles:
-  - **Archivist**: Extracts and organizes information
-  - **Drafter**: Creates initial synthesis
-  - **Critic**: Reviews and refines output
-- Individual metrics per agent role
+- Four-agent architecture with CrewAI Flows recursive orchestration:
+  - **Archivist**: Extracts and organizes information (runs once)
+  - **Drafter**: Creates synthesis (iterative)
+  - **Critic**: Reviews and provides feedback (iterative)
+  - **Orchestrator**: Decides whether to iterate or finalize (recursive control)
+- Recursive workflow: Archivist → [Drafter → Critic → Orchestrator] → loop until production-ready
+- Individual metrics per agent role including orchestrator
+- Iteration history with per-iteration drafts and critiques
 - Intermediate outputs captured for analysis
+- Max 5 iterations or 30-minute timeout
 
 **Evaluation Framework (`evaluate.py`)**
 - Automated comparison of both approaches
@@ -197,7 +201,7 @@ All 7 tests passing ✓
 | Requirement | Status | Implementation |
 |------------|--------|----------------|
 | Monolithic Agent | ✅ Complete | `monolithic.py` |
-| Ensemble Agent (3 roles) | ✅ Complete | `ensemble.py` |
+| Ensemble Agent (4 roles + orchestration) | ✅ Complete | `ensemble.py` (CrewAI Flows) |
 | Evaluation Framework | ✅ Complete | `evaluate.py` |
 | MLflow Integration | ✅ Complete | Full tracking in `evaluate.py` |
 | Process Metrics | ✅ Complete | Cost, latency, tokens |
@@ -212,11 +216,13 @@ All 7 tests passing ✓
 The implementation fully satisfies the problem statement requirements:
 - ✅ Empirical comparison framework
 - ✅ Monolithic vs Ensemble architectures
+- ✅ Recursive orchestration with quality control (ensemble)
 - ✅ Document synthesis capabilities
 - ✅ MLflow experiment tracking
-- ✅ Process metrics (cost, latency)
+- ✅ Process metrics (cost, latency, iterations)
 - ✅ Quality metrics (LLM-as-a-judge)
 - ✅ Reference-free evaluation
+- ✅ Iteration history artifacts
 - ✅ Ready for production use
 
 The system is production-ready, well-documented, and easily extensible for custom use cases.
