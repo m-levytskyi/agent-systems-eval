@@ -6,75 +6,28 @@ in MLflow and using MLflow GenAI LLM-judge scorers for quality evaluation.
 
 import os
 import json
+import sys
 from typing import List, Dict, Any
 from pathlib import Path
 
 import mlflow
+import pandas as pd
 from packaging.version import Version
 from dotenv import load_dotenv
-from PyPDF2 import PdfReader
 from rate_limits import RequestRateLimiter
 
 from monolithic import MonolithicAgent
 from ensemble import EnsembleAgent
+from utils import setup_logging, load_source_documents
 
 load_dotenv()
 
-
-def load_source_documents(doc_dir: str, pattern: str = "*.pdf") -> List[str]:
-    """Load all source documents (PDF or text) from the specified directory.
-    
-    Args:
-        doc_dir: Directory containing source documents
-        pattern: Glob pattern for filtering files (default: "*.pdf")
-    """
-    documents = []
-    doc_path = Path(doc_dir)
-    
-    # Load PDF files matching the pattern
-    for filepath in sorted(doc_path.glob(pattern)):
-        if filepath.suffix.lower() == '.pdf':
-            reader = PdfReader(filepath)
-            text = ""
-            for page in reader.pages:
-                text += page.extract_text() + "\n"
-            documents.append(text.strip())
-        elif filepath.suffix.lower() == '.txt':
-            with open(filepath, "r", encoding="utf-8") as f:
-                documents.append(f.read())
-    
-    return documents
-
+logger = setup_logging("evaluate")
 
 def load_tasks(task_file: str) -> List[Dict[str, Any]]:
     """Load synthesis tasks from JSON file."""
     with open(task_file, "r", encoding="utf-8") as f:
         return json.load(f)
-
-
-def estimate_cost(metrics: Dict[str, Any], model: str) -> float:
-    """
-    Estimate API cost based on token usage and model pricing.
-    
-    Pricing (as of 2024):
-    - Gemini Flash: Free tier up to 15 RPM, 1M TPM, 1500 RPD
-    - For paid: ~$0.000075/1K input tokens, ~$0.0003/1K output tokens
-    """
-    provider = os.getenv("LLM_PROVIDER", "ollama").strip().lower()
-    if provider == "ollama":
-        return 0.0
-
-    # Gemini pricing (very low cost)
-    if "gemini" in model.lower():
-        pricing = {"prompt": 0.000075, "completion": 0.0003}
-    else:
-        # Default fallback pricing
-        pricing = {"prompt": 0.001, "completion": 0.002}
-    
-    prompt_cost = (metrics["prompt_tokens"] / 1000) * pricing["prompt"]
-    completion_cost = (metrics["completion_tokens"] / 1000) * pricing["completion"]
-    
-    return prompt_cost + completion_cost
 
 
 def _score_value_to_float(value: Any) -> float:
@@ -112,19 +65,30 @@ def evaluate_with_mlflow_judges(
     reference_text: str,
     judge_model: str,
 ) -> Dict[str, Any]:
-    """Evaluate synthesis quality using MLflow GenAI built-in LLM-judge scorers."""
+    """Evaluate synthesis quality using concurrent execution with fallback to mlflow.genai.evaluate.
+    
+    Uses parallel execution for efficiency and weighted scoring for accuracy.
+    Grounding failures act as a kill-switch capping the overall score.
+    """
     try:
-        from mlflow.genai.scorers import RelevanceToQuery, Guidelines
+        from mlflow.genai.scorers import Guidelines
+        from concurrent.futures import ThreadPoolExecutor, as_completed
     except Exception as exc:
         raise RuntimeError(
             "MLflow GenAI scorers are not available. Install a recent MLflow version with GenAI support. "
             "(e.g., `pip install -U mlflow`)."
         ) from exc
 
-    inputs = {"query": task_description, "context": reference_text}
-
+    # Define scorers with proper Guidelines-based metrics
     scorers = [
-        RelevanceToQuery(name="relevance_to_task", model=judge_model),
+        Guidelines(
+            name="instruction_adherence",
+            model=judge_model,
+            guidelines=(
+                "The synthesis must strictly follow the task instructions provided in inputs.query. "
+                "It should address all requirements and constraints specified in the task."
+            ),
+        ),
         Guidelines(
             name="completeness",
             model=judge_model,
@@ -146,7 +110,7 @@ def evaluate_with_mlflow_judges(
             model=judge_model,
             guidelines=(
                 "All factual claims must be supported by the provided context in inputs.context. "
-                "Do not introduce unsupported facts."
+                "Do not introduce unsupported facts. This is a critical requirement."
             ),
         ),
         Guidelines(
@@ -158,33 +122,51 @@ def evaluate_with_mlflow_judges(
         ),
     ]
 
+    # Use concurrent execution for parallel scoring
+    inputs = {"query": task_description, "context": reference_text}
     scores: Dict[str, float] = {}
     feedback: Dict[str, Any] = {}
-    for scorer in scorers:
+    
+    def evaluate_scorer(scorer):
+        """Helper to evaluate a single scorer."""
         name = getattr(scorer, "name", scorer.__class__.__name__)
         fb = scorer(inputs=inputs, outputs=synthesis)
         value = getattr(fb, "value", fb)
         rationale = getattr(fb, "rationale", None)
-        scores[name] = _score_value_to_float(value)
-        feedback[name] = {"value": value, "rationale": rationale}
-
-    # For backward-compat with older metric names.
-    legacy = {
-        "completeness": scores.get("completeness", 0.0),
-        "coherence": scores.get("coherence", 0.0),
-        "accuracy": scores.get("grounded_in_sources", 0.0),
-        "quality": scores.get("professional_quality", 0.0),
-        "overall": (
-            scores.get("relevance_to_task", 0.0)
-            + scores.get("completeness", 0.0)
-            + scores.get("coherence", 0.0)
-            + scores.get("grounded_in_sources", 0.0)
-            + scores.get("professional_quality", 0.0)
-        )
-        / 5.0,
-    }
-
-    return {"scores": legacy, "detailed": feedback}
+        return name, _score_value_to_float(value), {"value": value, "rationale": rationale}
+    
+    # Run scorers concurrently
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(evaluate_scorer, scorer): scorer for scorer in scorers}
+        for future in as_completed(futures):
+            name, score, fb = future.result()
+            scores[name] = score
+            feedback[name] = fb
+    
+    # Compute weighted overall score with grounding kill-switch
+    grounding_score = scores.get("grounded_in_sources", 0.0)
+    instruction_adherence = scores.get("instruction_adherence", 0.0)
+    completeness = scores.get("completeness", 0.0)
+    coherence = scores.get("coherence", 0.0)
+    quality = scores.get("professional_quality", 0.0)
+    
+    # Weighted average: grounding and instruction adherence are critical
+    # Weights: grounding=0.3, instruction_adherence=0.25, completeness=0.2, coherence=0.15, quality=0.1
+    weighted_overall = (
+        grounding_score * 0.30 +
+        instruction_adherence * 0.25 +
+        completeness * 0.20 +
+        coherence * 0.15 +
+        quality * 0.10
+    )
+    
+    # Kill-switch: if grounding fails badly (< 0.5), cap overall at 0.5
+    if grounding_score < 0.5:
+        weighted_overall = min(weighted_overall, 0.5)
+    
+    scores["weighted_overall"] = weighted_overall
+    
+    return {"scores": scores, "detailed": feedback, "all_metrics": scores}
 
 
 def compute_nlp_metrics(reference: str, hypothesis: str) -> Dict[str, float]:
@@ -208,7 +190,6 @@ def compute_nlp_metrics(reference: str, hypothesis: str) -> Dict[str, float]:
         metrics['bertscore_recall'] = 0.0
         metrics['bertscore_f1'] = 0.0
         metrics['rouge1_f1'] = 0.0
-        metrics['rouge2_f1'] = 0.0
         metrics['rougeL_f1'] = 0.0
         return metrics
     
@@ -220,7 +201,7 @@ def compute_nlp_metrics(reference: str, hypothesis: str) -> Dict[str, float]:
         metrics['bertscore_recall'] = float(R[0])
         metrics['bertscore_f1'] = float(F1[0])
     except Exception as e:
-        print(f"Warning: BERTScore computation failed: {e}")
+        logger.warning(f"Warning: BERTScore computation failed: {e}")
         metrics['bertscore_precision'] = 0.0
         metrics['bertscore_recall'] = 0.0
         metrics['bertscore_f1'] = 0.0
@@ -228,15 +209,13 @@ def compute_nlp_metrics(reference: str, hypothesis: str) -> Dict[str, float]:
     try:
         # ROUGE scores
         from rouge_score import rouge_scorer
-        scorer = rouge_scorer.RougeScorer(['rouge1', 'rouge2', 'rougeL'], use_stemmer=True)
+        scorer = rouge_scorer.RougeScorer(['rouge1', 'rougeL'], use_stemmer=True)
         scores = scorer.score(reference, hypothesis)
         metrics['rouge1_f1'] = scores['rouge1'].fmeasure
-        metrics['rouge2_f1'] = scores['rouge2'].fmeasure
         metrics['rougeL_f1'] = scores['rougeL'].fmeasure
     except Exception as e:
-        print(f"Warning: ROUGE computation failed: {e}")
+        logger.warning(f"Warning: ROUGE computation failed: {e}")
         metrics['rouge1_f1'] = 0.0
-        metrics['rouge2_f1'] = 0.0
         metrics['rougeL_f1'] = 0.0
     
     return metrics
@@ -276,19 +255,16 @@ def run_experiment(
             mlflow.log_param("model", agent.model)
             
             # Run synthesis
-            print(f"\n{'='*60}")
-            print(f"Running {agent_type} on {task_id}")
-            print(f"{'='*60}")
+            logger.info(f"\n{'='*60}")
+            logger.info(f"Running {agent_type} on {task_id}")
+            logger.info(f"{'='*60}")
             
             result = agent.synthesize(source_documents, task_description)
             output = result.get("output") or ""
             metrics = result["metrics"]
 
             if not output.strip():
-                print("⚠️  Model returned empty output; judge and NLP metrics will be zero.")
-            
-            # Calculate cost
-            estimated_cost = estimate_cost(metrics, agent.model)
+                logger.warning("⚠️  Model returned empty output; judge and NLP metrics will be zero.")
             
             # Log process metrics
             mlflow.log_metric("latency_seconds", metrics["latency_seconds"])
@@ -296,7 +272,6 @@ def run_experiment(
             mlflow.log_metric("prompt_tokens", metrics["prompt_tokens"])
             mlflow.log_metric("completion_tokens", metrics["completion_tokens"])
             mlflow.log_metric("num_api_calls", metrics["num_api_calls"])
-            mlflow.log_metric("estimated_cost_usd", estimated_cost)
             
             # Log agent-specific metrics
             if agent_type == "ensemble":
@@ -306,8 +281,8 @@ def run_experiment(
                 mlflow.log_metric("orchestrator_tokens", metrics.get("orchestrator_tokens", 0))
                 mlflow.log_metric("num_iterations", metrics.get("num_iterations", 0))
             
-            # LLM-as-a-judge evaluation
-            print("Evaluating output quality with LLM judge...")
+            # LLM-as-a-judge evaluation (using concurrent futures for parallel execution)
+            logger.info("Evaluating output quality with LLM judge (parallel execution)...")
             reference_text = "\n\n".join(source_documents)
             judge_result = (
                 evaluate_with_mlflow_judges(
@@ -323,24 +298,31 @@ def run_experiment(
                 "accuracy": 0.0,
                 "quality": 0.0,
                 "overall": 0.0,
-            }, "detailed": {}}
+            }, "detailed": {}, "all_metrics": {}}
             )
             judge_scores = judge_result["scores"]
+            all_metrics = judge_result.get("all_metrics", {})
+            detailed_feedback = judge_result.get("detailed", {})
             
-            # Log quality scores
+            # Log quality scores with weighted overall
             for criterion, score in judge_scores.items():
                 mlflow.log_metric(f"judge_{criterion}_score", score)
+            
+            # Log all detailed metrics
+            for metric_name, score in all_metrics.items():
+                if f"judge_{metric_name}_score" not in [f"judge_{k}_score" for k in judge_scores.keys()]:
+                    mlflow.log_metric(f"judge_{metric_name}_score", score)
 
             # Store rationales as an artifact for later inspection
-            if judge_result.get("detailed"):
+            if detailed_feedback:
                 judge_file = f"{agent_type}_{task_id}_judge_feedback.json"
                 with open(judge_file, "w", encoding="utf-8") as f:
-                    json.dump(judge_result["detailed"], f, ensure_ascii=False, indent=2)
+                    json.dump(detailed_feedback, f, ensure_ascii=False, indent=2)
                 mlflow.log_artifact(judge_file)
                 os.remove(judge_file)
             
             # Compute NLP metrics (using concatenated source documents as reference)
-            print("Computing NLP metrics (BERTScore, ROUGE)...")
+            logger.info("Computing NLP metrics (BERTScore, ROUGE)...")
             nlp_metrics = compute_nlp_metrics(reference_text, output)
             
             # Log NLP metrics
@@ -354,9 +336,58 @@ def run_experiment(
             mlflow.log_artifact(output_file)
             os.remove(output_file)
             
+            # Log monolithic document summaries
+            if agent_type == "monolithic" and "intermediate_outputs" in result:
+                intermediate = result["intermediate_outputs"]
+                
+                if "document_summaries" in intermediate:
+                    for idx, summary in enumerate(intermediate["document_summaries"], start=1):
+                        summary_file = f"{agent_type}_{task_id}_doc_{idx}_summary.txt"
+                        with open(summary_file, "w", encoding="utf-8") as f:
+                            f.write(summary)
+                        mlflow.log_artifact(summary_file)
+                        os.remove(summary_file)
+                
+                # Log summary metadata as JSON
+                if "summary_metadata" in intermediate:
+                    metadata_file = f"{agent_type}_{task_id}_summary_metadata.json"
+                    with open(metadata_file, "w", encoding="utf-8") as f:
+                        json.dump(intermediate["summary_metadata"], f, ensure_ascii=False, indent=2)
+                    mlflow.log_artifact(metadata_file)
+                    os.remove(metadata_file)
+                
+                # Log summarization metrics
+                if "document_summaries_tokens" in metrics:
+                    mlflow.log_metric("document_summaries_tokens", metrics["document_summaries_tokens"])
+                if "num_documents_summarized" in metrics:
+                    mlflow.log_metric("num_documents_summarized", metrics["num_documents_summarized"])
+            
             # Log intermediate outputs for ensemble
             if agent_type == "ensemble" and "intermediate_outputs" in result:
                 intermediate = result["intermediate_outputs"]
+                
+                # Log document summaries from ensemble archivist
+                if "document_summaries" in intermediate:
+                    for idx, summary in enumerate(intermediate["document_summaries"], start=1):
+                        summary_file = f"{agent_type}_{task_id}_doc_{idx}_summary.txt"
+                        with open(summary_file, "w", encoding="utf-8") as f:
+                            f.write(summary)
+                        mlflow.log_artifact(summary_file)
+                        os.remove(summary_file)
+                
+                # Log summary metadata as JSON
+                if "summary_metadata" in intermediate:
+                    metadata_file = f"{agent_type}_{task_id}_summary_metadata.json"
+                    with open(metadata_file, "w", encoding="utf-8") as f:
+                        json.dump(intermediate["summary_metadata"], f, ensure_ascii=False, indent=2)
+                    mlflow.log_artifact(metadata_file)
+                    os.remove(metadata_file)
+                
+                # Log summarization metrics
+                if "document_summaries_tokens" in metrics:
+                    mlflow.log_metric("document_summaries_tokens", metrics["document_summaries_tokens"])
+                if "num_documents_summarized" in metrics:
+                    mlflow.log_metric("num_documents_summarized", metrics["num_documents_summarized"])
                 
                 # Log archived_info and draft
                 for stage in ["archived_info", "draft"]:
@@ -390,32 +421,40 @@ def run_experiment(
                             f.write(iteration_data.get("critique", ""))
                         mlflow.log_artifact(critique_file)
                         os.remove(critique_file)
-            
-            print("\nMetrics Summary:")
-            print(f"  Latency: {metrics['latency_seconds']:.2f}s")
-            print(f"  Total Tokens: {metrics['total_tokens']}")
-            print(f"  API Calls: {metrics['num_api_calls']}")
-            print(f"  Estimated Cost: ${estimated_cost:.4f}")
+                        
+            logger.info("\nMetrics Summary:")
+            logger.info(f"  Latency: {metrics['latency_seconds']:.2f}s")
+            logger.info(f"  Total Tokens: {metrics['total_tokens']}")
+            logger.info(f"  API Calls: {metrics['num_api_calls']}")
             if agent_type == "ensemble":
-                print(f"  Iterations: {metrics.get('num_iterations', 0)}")
-            print("\nJudge Scores:")
+                logger.info(f"  Iterations: {metrics.get('num_iterations', 0)}")
+            logger.info("\nJudge Scores (0-1 scale, weighted with grounding kill-switch):")
             for criterion, score in judge_scores.items():
-                print(f"  {criterion.capitalize()}: {score}/5")
-            print("\nNLP Metrics:")
+                # MLflow scorers return 0-1; we keep the native scale to avoid the misleading "/5" label.
+                logger.info(f"  {criterion.capitalize()}: {score:.2f}")
+            
+            logger.info("\nNLP Metrics:")
             for metric_name, metric_value in nlp_metrics.items():
-                print(f"  {metric_name}: {metric_value:.4f}")
+                logger.info(f"  {metric_name}: {metric_value:.4f}")
 
 
 def main():
     """Main evaluation function."""
-    print("="*60)
-    print("Document Synthesis Evaluation: Monolithic vs Ensemble")
-    print("="*60)
+    
+    # Check for test mode
+    test_mode = "--test" in sys.argv or "-t" in sys.argv
+    
+    logger.info("="*60)
+    if test_mode:
+        logger.info("TEST MODE: Single Paper Evaluation")
+    else:
+        logger.info("Document Synthesis Evaluation: Monolithic vs Ensemble")
+    logger.info("="*60)
     
     # Configuration
     doc_dir = "data/source_documents"
     task_file = "data/tasks/synthesis_tasks.json"
-    doc_pattern = "paper_*.pdf"  # Use paper_*.pdf for evaluation
+    doc_pattern = "paper_1.pdf" if test_mode else "paper_*.pdf"  # Single paper for test mode
     model = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
     judge_model = os.getenv("JUDGE_MODEL", f"openai:/{model}")
     crewai_model = os.getenv("CREWAI_MODEL", f"openai/{model}")
@@ -425,12 +464,17 @@ def main():
     rpd_limit = int(os.getenv("MAX_RPD", "0"))
     
     # Load data
-    print("\nLoading source documents and tasks...")
+    logger.info("\nLoading source documents and tasks...")
     source_documents = load_source_documents(doc_dir, pattern=doc_pattern)
     tasks = load_tasks(task_file)
     
-    print(f"Loaded {len(source_documents)} source documents")
-    print(f"Loaded {len(tasks)} synthesis tasks")
+    if test_mode:
+        logger.info(f"\n⚠️  TEST MODE: Using only first document and first task")
+        source_documents = source_documents[:1]
+        tasks = tasks[:1]
+    
+    logger.info(f"Loaded {len(source_documents)} source documents")
+    logger.info(f"Loaded {len(tasks)} synthesis tasks")
     
     # Initialize MLflow
     mlflow.set_tracking_uri("file:./mlruns")
@@ -441,25 +485,25 @@ def main():
         rate_limiter = RequestRateLimiter(max_per_minute=rpm_limit, max_per_day=rpd_limit)
     
     # Run monolithic agent experiments
-    print("\n" + "="*60)
-    print("MONOLITHIC AGENT EVALUATION")
-    print("="*60)
+    logger.info("\n" + "="*60)
+    logger.info("MONOLITHIC AGENT EVALUATION")
+    logger.info("="*60)
     monolithic_agent = MonolithicAgent(model=model, rate_limiter=rate_limiter)
     run_experiment("monolithic", monolithic_agent, source_documents, tasks, judge_model)
     
     # Run ensemble agent experiments (CrewAI Flow-based with recursive orchestration)
-    print("\n" + "="*60)
-    print("ENSEMBLE AGENT EVALUATION (CrewAI Flows with Orchestrator)")
-    print("="*60)
+    logger.info("\n" + "="*60)
+    logger.info("ENSEMBLE AGENT EVALUATION (CrewAI Flows with Orchestrator)")
+    logger.info("="*60)
     ensemble_agent = EnsembleAgent(model=crewai_model, rate_limiter=rate_limiter)
     run_experiment("ensemble", ensemble_agent, source_documents, tasks, judge_model)
     
-    print("\n" + "="*60)
-    print("EVALUATION COMPLETE")
-    print("="*60)
-    print("\nResults logged to MLflow. To view:")
-    print("  mlflow ui")
-    print("\nThen open http://localhost:5000 in your browser")
+    logger.info("\n" + "="*60)
+    logger.info("EVALUATION COMPLETE")
+    logger.info("="*60)
+    logger.info("\nResults logged to MLflow. To view:")
+    logger.info("  mlflow ui")
+    logger.info("\nThen open http://localhost:5000 in your browser")
 
 
 if __name__ == "__main__":
