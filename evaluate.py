@@ -7,6 +7,7 @@ in MLflow and using MLflow GenAI LLM-judge scorers for quality evaluation.
 import os
 import json
 import sys
+import argparse
 from typing import List, Dict, Any
 from pathlib import Path
 
@@ -62,110 +63,160 @@ def evaluate_with_mlflow_judges(
     *,
     task_description: str,
     synthesis: str,
-    reference_text: str,
+    context: str,
     judge_model: str,
 ) -> Dict[str, Any]:
-    """Evaluate synthesis quality using concurrent execution with fallback to mlflow.genai.evaluate.
+    """Evaluate synthesis quality using mlflow.genai.evaluate with specific judges.
     
-    Uses parallel execution for efficiency and weighted scoring for accuracy.
-    Grounding failures act as a kill-switch capping the overall score.
+    Uses groundedness, instruction_adherence and completeness judges.
     """
     try:
-        from mlflow.genai.scorers import Guidelines
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-    except Exception as exc:
+        from mlflow.genai.judges import make_judge
+    except ImportError as exc:
         raise RuntimeError(
-            "MLflow GenAI scorers are not available. Install a recent MLflow version with GenAI support. "
-            "(e.g., `pip install -U mlflow`)."
+            "MLflow GenAI judges are not available. Install a recent MLflow version with GenAI support."
         ) from exc
-
-    # Define scorers with proper Guidelines-based metrics
-    scorers = [
-        Guidelines(
-            name="instruction_adherence",
-            model=judge_model,
-            guidelines=(
-                "The synthesis must strictly follow the task instructions provided in inputs.query. "
-                "It should address all requirements and constraints specified in the task."
-            ),
-        ),
-        Guidelines(
-            name="completeness",
-            model=judge_model,
-            guidelines=(
-                "The synthesis must fully address the task requirements. "
-                "It should cover all key aspects implied by the task prompt."
-            ),
-        ),
-        Guidelines(
-            name="coherence",
-            model=judge_model,
-            guidelines=(
-                "The synthesis must be clear, logically structured, and coherent. "
-                "It should read as a single integrated document."
-            ),
-        ),
-        Guidelines(
-            name="grounded_in_sources",
-            model=judge_model,
-            guidelines=(
-                "All factual claims must be supported by the provided context in inputs.context. "
-                "Do not introduce unsupported facts. This is a critical requirement."
-            ),
-        ),
-        Guidelines(
-            name="professional_quality",
-            model=judge_model,
-            guidelines=(
-                "The synthesis must be professional quality: accurate, appropriately detailed, and well written."
-            ),
-        ),
-    ]
-
-    # Use concurrent execution for parallel scoring
-    inputs = {"query": task_description, "context": reference_text}
-    scores: Dict[str, float] = {}
-    feedback: Dict[str, Any] = {}
     
-    def evaluate_scorer(scorer):
-        """Helper to evaluate a single scorer."""
-        name = getattr(scorer, "name", scorer.__class__.__name__)
-        fb = scorer(inputs=inputs, outputs=synthesis)
-        value = getattr(fb, "value", fb)
-        rationale = getattr(fb, "rationale", None)
-        return name, _score_value_to_float(value), {"value": value, "rationale": rationale}
-    
-    # Run scorers concurrently
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(evaluate_scorer, scorer): scorer for scorer in scorers}
-        for future in as_completed(futures):
-            name, score, fb = future.result()
-            scores[name] = score
-            feedback[name] = fb
-    
-    # Compute weighted overall score with grounding kill-switch
-    grounding_score = scores.get("grounded_in_sources", 0.0)
-    instruction_adherence = scores.get("instruction_adherence", 0.0)
-    completeness = scores.get("completeness", 0.0)
-    coherence = scores.get("coherence", 0.0)
-    quality = scores.get("professional_quality", 0.0)
-    
-    # Weighted average: grounding and instruction adherence are critical
-    # Weights: grounding=0.3, instruction_adherence=0.25, completeness=0.2, coherence=0.15, quality=0.1
-    weighted_overall = (
-        grounding_score * 0.30 +
-        instruction_adherence * 0.25 +
-        completeness * 0.20 +
-        coherence * 0.15 +
-        quality * 0.10
+    # 1. Define Judges
+    # Note: MLflow variables must be exactly {{ inputs }}, {{ outputs }}, etc. No dot notation allowed.
+    # We will pass a formatted string containing both task and context into inputs.
+    groundedness_judge = make_judge(
+        name="groundedness",
+        model=judge_model,
+        instructions=(
+            "You are an expert academic reviewer evaluating **Groundedness**.\n\n"
+            "**Task**: Verify all claims in the Agent Output can be traced to the Context.\n\n"
+            "**Evaluation Criteria:**\n"
+            "1. **Direct Statements**: Facts, statistics, and specific findings must be in the Context\n"
+            "2. **Reasonable Synthesis**: Allow paraphrasing and combining related information from Context\n"
+            "3. **Hallucination Detection**: Flag ONLY information that cannot be traced to Context at all\n\n"
+            "**Grading Scale (0-5):**\n"
+            "- 0: Contains fabricated information not traceable to Context\n"
+            "- 1: Significant hallucinations or unsupported claims\n"
+            "- 2: Some claims lack clear support in Context\n"
+            "- 3: Mostly grounded with minor paraphrasing issues\n"
+            "- 4: Well-grounded, reasonable synthesis\n"
+            "- 5: Perfectly grounded, all claims directly traceable\n\n"
+            "**Input Data (Task + Context):**\n{{ inputs }}\n\n"
+            "**Agent Output:**\n{{ outputs }}\n\n"
+            "Consider: Synthesis requires combining information. Paraphrasing is acceptable if the core meaning is preserved."
+        ),
     )
+
+    instruction_adherence_judge = make_judge(
+        name="instruction_adherence",
+        model=judge_model,
+        instructions=(
+            "You are a strict Logic Evaluator. Assess **Instruction Adherence** with rigorous precision.\n\n"
+            "**Input Data (containing Task and Context):**\n"
+            "{{ inputs }}\n\n"
+            "**Strict Evaluation Criteria:**\n"
+            "1. **Expected Elements Coverage:** Check if ALL expected elements from the task (if specified) are explicitly addressed. Missing even ONE element should reduce the score.\n"
+            "2. **Format Compliance:** If the task requested specific format (JSON, list, headers, sections), verify EXACT adherence. Generic prose when structure was requested = major penalty.\n"
+            "3. **Task Fidelity:** Did the output perform ONLY the specific task requested without scope drift? Check:\n"
+            "   - Task 1 (scope/terminology) should NOT include detailed findings from individual papers\n"
+            "   - Task 2 (structured extraction) should cover EACH paper individually, not synthesize across them\n"
+            "   - Task 3 (comparative meta-analysis) should identify patterns ACROSS papers, not just list them\n"
+            "4. **Negative Constraints:** If task specified exclusions or what NOT to do, verify strict compliance.\n"
+            "5. **Specificity Requirements:** If task asks for 'explicit research questions' or 'key statistical findings', vague summaries are insufficient.\n\n"
+            "**Grading Scale (0-5) - BE HARSH:**\n"
+            "- 0-1: Wrong task entirely, or ignored critical format requirements\n"
+            "- 2: Correct general direction but missing 2+ expected elements OR significant format violations\n"
+            "- 3: Addressed most requirements but missing 1 expected element OR minor format issues OR insufficient specificity\n"
+            "- 4: All expected elements present with good structure, but minor deviations in depth or formatting\n"
+            "- 5: Perfect compliance - all elements, correct format, appropriate scope, proper specificity\n\n"
+            "**Agent Output:**\n"
+            "{{ outputs }}\n\n"
+            "**Scoring Philosophy:** Default to 2-3 range. Only award 4-5 for truly excellent adherence. Penalize heavily for missing expected elements or wrong task interpretation."
+        ),
+    )
+
+    completeness_judge = make_judge(
+        name="completeness",
+        model=judge_model,
+        instructions=(
+            "You are evaluating **Completeness** of a synthesis output.\n\n"
+            "**Evaluation Criteria:**\n"
+            "1. **Task Requirements**: Check if Output addresses all elements requested in the TASK\n"
+            "2. **Coverage**: If task mentions specific topics/papers, verify they're included\n"
+            "3. **Depth**: Sections should have substance, not empty placeholders\n"
+            "4. **Scope Accuracy**: Output should ONLY include information from the provided Context\n\n"
+            "**Grading Scale (1-5):**\n"
+            "- 1: Misses most required elements\n"
+            "- 2: Partial coverage, significant gaps\n"
+            "- 3: Adequate coverage with some omissions\n"
+            "- 4: Comprehensive, minor elements missing\n"
+            "- 5: Complete coverage of all task requirements\n\n"
+            "**Input Data (Task + Context):**\n{{ inputs }}\n\n"
+            "**Agent Output:**\n{{ outputs }}\n\n"
+            "Note: First verify the Output only uses information from Context, then assess completeness."
+        ),
+    )
+
+    # 2. Prepare Data
+    formatted_inputs = f"TASK:\n{task_description}\n\nCONTEXT (Summaries):\n{context}"
+    inputs_payload = {"inputs": formatted_inputs}
+    outputs_payload = {"outputs": synthesis}
+
+    # 3. Runs Judges Manually
+    # Note: Call judges directly to avoid MLflow type check issues (InstructionsJudge vs EvaluationMetric)
+    import time
     
-    # Kill-switch: if grounding fails badly (< 0.5), cap overall at 0.5
-    if grounding_score < 0.5:
-        weighted_overall = min(weighted_overall, 0.5)
+    scores = {}
+    feedback = {}
     
-    scores["weighted_overall"] = weighted_overall
+    # Define metric names mapping
+    judge_map = {
+        "groundedness": groundedness_judge,
+        "instruction_adherence": instruction_adherence_judge,
+        "completeness": completeness_judge
+    }
     
+    # Debug: Log what's being evaluated
+    logger.info(f"\n{'='*60}")
+    logger.info("DEBUG: Evaluating synthesis with judges")
+    logger.info(f"Synthesis length: {len(synthesis)} chars")
+    logger.info(f"Synthesis preview (first 200 chars): {synthesis[:200]}...")
+    logger.info(f"Context length: {len(context)} chars")
+    logger.info(f"{'='*60}\n")
+    
+    for name, judge in judge_map.items():
+        try:
+            logger.info(f"Running judge: {name}")
+            # Judge call returns an Assessment/EvaluationResult object
+            # Pass inputs/outputs as dictionaries as expected by InstructionsJudge
+            result = judge(inputs=inputs_payload, outputs=outputs_payload)
+            
+            # Debug: Log raw judge result
+            logger.info(f"DEBUG: Judge '{name}' raw result type: {type(result)}")
+            logger.info(f"DEBUG: Judge '{name}' result attributes: {dir(result)}")
+            
+            # Extract score and justification
+            score_val = getattr(result, "score", None)
+            if score_val is None:
+                score_val = getattr(result, "value", 0.0)
+            
+            logger.info(f"DEBUG: Judge '{name}' extracted score_val: {score_val} (type: {type(score_val)})")
+                
+            justification = getattr(result, "justification", None)
+            if justification is None:
+                justification = getattr(result, "rationale", "No rationale.")
+            
+            logger.info(f"DEBUG: Judge '{name}' justification preview: {str(justification)[:200]}...")
+            
+            scores[name] = _score_value_to_float(score_val)
+            feedback[name] = justification
+            
+            logger.info(f"DEBUG: Judge '{name}' final float score: {scores[name]}")
+            
+            # Rate limit sleep (10 RPM = 6s per request)
+            time.sleep(6)
+            
+        except Exception as e:
+            logger.error(f"Judge {name} failed: {e}")
+            scores[name] = 0.0
+            feedback[name] = f"Error: {e}"
+
     return {"scores": scores, "detailed": feedback, "all_metrics": scores}
 
 
@@ -194,12 +245,28 @@ def compute_nlp_metrics(reference: str, hypothesis: str) -> Dict[str, float]:
         return metrics
     
     try:
-        # BERTScore
+        # BERTScore with distilbert (3x faster than roberta-large) and CPU fallback for CUDA errors
         from bert_score import score as bert_score
-        P, R, F1 = bert_score([hypothesis], [reference], lang='en', verbose=False)
-        metrics['bertscore_precision'] = float(P[0])
-        metrics['bertscore_recall'] = float(R[0])
-        metrics['bertscore_f1'] = float(F1[0])
+        try:
+            P, R, F1 = bert_score([hypothesis], [reference], 
+                                 model_type='distilbert-base-uncased',
+                                 lang='en', verbose=False)
+            metrics['bertscore_precision'] = float(P[0])
+            metrics['bertscore_recall'] = float(R[0])
+            metrics['bertscore_f1'] = float(F1[0])
+            logger.info(f"BERTScore computed successfully (GPU, distilbert)")
+        except RuntimeError as cuda_err:
+            if "CUDA" in str(cuda_err) or "kernel" in str(cuda_err).lower():
+                logger.warning(f"CUDA error in BERTScore, falling back to CPU: {cuda_err}")
+                P, R, F1 = bert_score([hypothesis], [reference], 
+                                     model_type='distilbert-base-uncased',
+                                     lang='en', verbose=False, device='cpu')
+                metrics['bertscore_precision'] = float(P[0])
+                metrics['bertscore_recall'] = float(R[0])
+                metrics['bertscore_f1'] = float(F1[0])
+                logger.info(f"BERTScore computed successfully (CPU fallback, distilbert)")
+            else:
+                raise
     except Exception as e:
         logger.warning(f"Warning: BERTScore computation failed: {e}")
         metrics['bertscore_precision'] = 0.0
@@ -227,6 +294,7 @@ def run_experiment(
     source_documents: List[str],
     tasks: List[Dict[str, Any]],
     judge_model: str,
+    agent_model_type: str = "ollama",
 ) -> None:
     """
     Run an experiment for a specific agent type.
@@ -237,8 +305,9 @@ def run_experiment(
         source_documents: List of source documents
         tasks: List of synthesis tasks
         judge_model: Model to use for LLM-as-a-judge evaluation
+        agent_model_type: "ollama" or "gemini" - appends _gemini suffix if gemini
     """
-    experiment_name = f"document_synthesis_{agent_type}"
+    experiment_name = f"document_synthesis_{agent_type}{'_gemini' if agent_model_type == 'gemini' else ''}"
     
     mlflow.set_experiment(experiment_name)
     
@@ -281,14 +350,39 @@ def run_experiment(
                 mlflow.log_metric("orchestrator_tokens", metrics.get("orchestrator_tokens", 0))
                 mlflow.log_metric("num_iterations", metrics.get("num_iterations", 0))
             
-            # LLM-as-a-judge evaluation (using concurrent futures for parallel execution)
-            logger.info("Evaluating output quality with LLM judge (parallel execution)...")
-            reference_text = "\n\n".join(source_documents)
+            # LLM-as-a-judge evaluation
+            logger.info("\n" + "="*60)
+            logger.info("Evaluating output quality with LLM judge...")
+            logger.info(f"Output to evaluate - length: {len(output)} chars")
+            logger.info(f"Output preview (first 300 chars): {output[:300]}...")
+            logger.info("="*60 + "\n")
+            
+            # Prepare context from summaries if available, else raw documents
+            context_text = ""
+            if "intermediate_outputs" in result and "document_summaries" in result["intermediate_outputs"]:
+                summaries = result["intermediate_outputs"]["document_summaries"]
+                for i, s in enumerate(summaries, 1):
+                    context_text += f"Summary Paper {i}: {s}\n\n"
+            
+            if not context_text.strip():
+                # Fallback to full source documents if summaries missing
+                logger.info("No summaries found in output; using full source documents for judge context.")
+                context_text = "\n\n".join(source_documents)
+            
+            # Prepare reference text for NLP metrics: use summaries if available (more appropriate comparison)
+            # Comparing draft synthesis to summaries is more meaningful than to full source docs
+            reference_text_for_nlp = context_text if context_text.strip() else "\n\n".join(source_documents)
+            
+            # Debug: Log what's being used for NLP metrics
+            logger.info(f"DEBUG: NLP metrics reference source: {'summaries' if context_text.strip() else 'full documents'}")
+            logger.info(f"DEBUG: Reference length: {len(reference_text_for_nlp)} chars")
+            logger.info(f"DEBUG: Hypothesis (output) length: {len(output)} chars")
+
             judge_result = (
                 evaluate_with_mlflow_judges(
                     task_description=task_description,
                     synthesis=output,
-                    reference_text=reference_text,
+                    context=context_text,
                     judge_model=judge_model,
                 )
                 if output
@@ -323,7 +417,7 @@ def run_experiment(
             
             # Compute NLP metrics (using concatenated source documents as reference)
             logger.info("Computing NLP metrics (BERTScore, ROUGE)...")
-            nlp_metrics = compute_nlp_metrics(reference_text, output)
+            nlp_metrics = compute_nlp_metrics(reference_text_for_nlp, output)
             
             # Log NLP metrics
             for metric_name, metric_value in nlp_metrics.items():
@@ -441,23 +535,57 @@ def run_experiment(
 def main():
     """Main evaluation function."""
     
-    # Check for test mode
-    test_mode = "--test" in sys.argv or "-t" in sys.argv
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser(
+        description="Evaluate Monolithic vs Ensemble agents for document synthesis"
+    )
+    parser.add_argument(
+        "--agents-model",
+        choices=["ollama", "gemini"],
+        default="ollama",
+        help="Model to use for agents: 'ollama' (default) or 'gemini'. Judges always use Gemini."
+    )
+    parser.add_argument(
+        "-t", "--test",
+        action="store_true",
+        help="Run in test mode (single paper, single task)"
+    )
+    args = parser.parse_args()
+    
+    test_mode = args.test
+    agents_model = args.agents_model
     
     logger.info("="*60)
     if test_mode:
         logger.info("TEST MODE: Single Paper Evaluation")
     else:
         logger.info("Document Synthesis Evaluation: Monolithic vs Ensemble")
+    logger.info(f"Agents Model: {agents_model.upper()}")
     logger.info("="*60)
+    
+    # Validate Gemini API key if using Gemini for agents
+    if agents_model == "gemini":
+        gemini_api_key = os.getenv("GEMINI_API_KEY")
+        if not gemini_api_key:
+            logger.error("ERROR: GEMINI_API_KEY environment variable is not set.")
+            logger.error("Please set GEMINI_API_KEY in your .env file to use --agents-model=gemini")
+            sys.exit(1)
     
     # Configuration
     doc_dir = "data/source_documents"
     task_file = "data/tasks/synthesis_tasks.json"
     doc_pattern = "paper_1.pdf" if test_mode else "paper_*.pdf"  # Single paper for test mode
-    model = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
-    judge_model = os.getenv("JUDGE_MODEL", f"openai:/{model}")
-    crewai_model = os.getenv("CREWAI_MODEL", f"openai/{model}")
+    
+    # Set model strings based on agents_model selection
+    if agents_model == "ollama":
+        model = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
+        crewai_model = os.getenv("CREWAI_MODEL", f"openai/{model}")
+    else:  # gemini
+        model = "gemini-2.5-flash-lite"
+        crewai_model = "gemini/gemini-2.5-flash-lite"
+    
+    # Judge model always uses Gemini
+    judge_model = os.getenv("JUDGE_MODEL", "gemini:/gemini-2.5-flash-lite")
 
     # Optional rate limiting for remote providers
     rpm_limit = int(os.getenv("MAX_RPM", "0"))
@@ -489,14 +617,14 @@ def main():
     logger.info("MONOLITHIC AGENT EVALUATION")
     logger.info("="*60)
     monolithic_agent = MonolithicAgent(model=model, rate_limiter=rate_limiter)
-    run_experiment("monolithic", monolithic_agent, source_documents, tasks, judge_model)
+    run_experiment("monolithic", monolithic_agent, source_documents, tasks, judge_model, agents_model)
     
     # Run ensemble agent experiments (CrewAI Flow-based with recursive orchestration)
     logger.info("\n" + "="*60)
     logger.info("ENSEMBLE AGENT EVALUATION (CrewAI Flows with Orchestrator)")
     logger.info("="*60)
     ensemble_agent = EnsembleAgent(model=crewai_model, rate_limiter=rate_limiter)
-    run_experiment("ensemble", ensemble_agent, source_documents, tasks, judge_model)
+    run_experiment("ensemble", ensemble_agent, source_documents, tasks, judge_model, agents_model)
     
     logger.info("\n" + "="*60)
     logger.info("EVALUATION COMPLETE")
