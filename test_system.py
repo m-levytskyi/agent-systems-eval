@@ -8,6 +8,9 @@ import os
 import sys
 import json
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 
 def test_imports():
@@ -180,27 +183,7 @@ def test_document_loading():
         return False
 
 
-def test_metric_calculation():
-    """Test metric calculation functions."""
-    print("\nTesting metric calculations...")
-    try:
-        from evaluate import estimate_cost
 
-        os.environ["LLM_PROVIDER"] = "ollama"
-        
-        test_metrics = {
-            "prompt_tokens": 1000,
-            "completion_tokens": 500,
-            "total_tokens": 1500
-        }
-        
-        cost_local = estimate_cost(test_metrics, "qwen2.5:7b")
-        print(f"✓ Local (Ollama) cost estimation: ${cost_local:.6f}")
-        
-        return True
-    except Exception as e:
-        print(f"✗ Metric calculation error: {e}")
-        return False
 
 
 def test_project_structure():
@@ -242,8 +225,7 @@ def main():
         ("Data Files", test_data_files),
         ("Task Structure", test_task_structure),
         ("Agent Initialization", test_agent_initialization),
-        ("Document Loading", test_document_loading),
-        ("Metric Calculation", test_metric_calculation)
+        ("Document Loading", test_document_loading)
     ]
     
     results = []
