@@ -16,7 +16,7 @@ from rate_limits import RequestRateLimiter
 
 from llm.base import LLMClient
 from llm.factory import create_llm_client, get_max_output_tokens
-from utils import setup_logging, sanitize_document, chunk_document, estimate_tokens
+from utils import setup_logging, sanitize_document, chunk_document, estimate_tokens, process_documents_with_cache
 
 load_dotenv()
 
@@ -159,102 +159,19 @@ Provide a comprehensive summary that preserves all critical information, finding
         Returns:
             Tuple of (summaries, summary_metadata)
         """
+        summaries, summary_metadata, aggregated_metrics = process_documents_with_cache(
+            source_documents=source_documents,
+            cache_dir=cache_dir,
+            process_chunk_func=self._summarize_document_chunk,
+            logger=logger
+        )
         
-        # Create cache directory
-        cache_path = Path(cache_dir)
-        cache_path.mkdir(parents=True, exist_ok=True)
-        
-        summaries = []
-        summary_metadata = []
-        
-        logger.info(f"{'='*60}")
-        logger.info(f"MAP PHASE: Summarizing {len(source_documents)} documents")
-        logger.info(f"Cache directory: {cache_dir}")
-        logger.info(f"{'='*60}")
-        
-        for doc_idx, doc in enumerate(source_documents, start=1):
-            # Check cache first
-            cache_file = cache_path / f"doc_{doc_idx}_summary.json"
-            
-            if cache_file.exists():
-                logger.info(f"Document {doc_idx}/{len(source_documents)}: Loading from cache...")
-                with open(cache_file, 'r') as f:
-                    cached = json.load(f)
-                    summaries.append(cached['summary'])
-                    summary_metadata.append(cached['metadata'])
-                    # Update metrics from cache
-                    self.metrics["num_api_calls"] += cached['metadata'].get('num_api_calls', 0)
-                    self.metrics["document_summaries_tokens"] += cached['metadata']['tokens_used']
-                continue
-            
-            logger.info(f"Processing Document {doc_idx}/{len(source_documents)}...")
-            
-            # Sanitize document
-            sanitized_doc = sanitize_document(doc)
-            original_tokens = estimate_tokens(doc)
-            sanitized_tokens = estimate_tokens(sanitized_doc)
-            tokens_saved = original_tokens - sanitized_tokens
-            
-            logger.info(f"  Original: ~{original_tokens:,} tokens")
-            logger.info(f"  Sanitized: ~{sanitized_tokens:,} tokens (saved ~{tokens_saved:,})")
-            
-            # Chunk if necessary
-            chunks = chunk_document(sanitized_doc, max_tokens=16000)
-            logger.info(f"  Chunks: {len(chunks)}")
-            
-            # Summarize each chunk
-            chunk_summaries = []
-            chunk_metrics = []
-            
-            for chunk_idx, chunk in enumerate(chunks, start=1):
-                chunk_tokens = estimate_tokens(chunk)
-                logger.info(f"    Chunk {chunk_idx}/{len(chunks)}: ~{chunk_tokens:,} tokens")
-                
-                summary, metrics = self._summarize_document_chunk(
-                    chunk=chunk,
-                    doc_index=doc_idx,
-                    chunk_index=chunk_idx,
-                    total_chunks=len(chunks),
-                )
-                
-                chunk_summaries.append(summary)
-                chunk_metrics.append(metrics)
-                
-                # Update global metrics
-                self.metrics["num_api_calls"] += 1
-                self.metrics["prompt_tokens"] += metrics["prompt_tokens"]
-                self.metrics["completion_tokens"] += metrics["completion_tokens"]
-                self.metrics["total_tokens"] += metrics["total_tokens"]
-                self.metrics["document_summaries_tokens"] += metrics["total_tokens"]
-            
-            # Combine chunk summaries for this document
-            if len(chunks) > 1:
-                combined_summary = f"DOCUMENT {doc_idx} (multi-part summary):\n\n" + "\n\n---\n\n".join(chunk_summaries)
-            else:
-                combined_summary = f"DOCUMENT {doc_idx}:\n\n{chunk_summaries[0]}"
-            
-            summaries.append(combined_summary)
-            metadata = {
-                "doc_index": doc_idx,
-                "original_length": len(doc),
-                "sanitized_length": len(sanitized_doc),
-                "num_chunks": len(chunks),
-                "summary_length": len(combined_summary),
-                "tokens_used": sum(m["total_tokens"] for m in chunk_metrics),
-                "num_api_calls": len(chunks),
-            }
-            summary_metadata.append(metadata)
-            
-            # Save checkpoint
-            with open(cache_file, 'w') as f:
-                json.dump({
-                    'summary': combined_summary,
-                    'metadata': metadata
-                }, f, indent=2)
-            
-            logger.info(f"  Summary: {len(combined_summary)} chars, {sum(m['total_tokens'] for m in chunk_metrics)} tokens")
-            logger.info(f"  ✓ Checkpoint saved to {cache_file}")
-        
+        # Update metrics
+        self.metrics["num_api_calls"] += aggregated_metrics["num_api_calls"]
+        self.metrics["total_tokens"] += aggregated_metrics["total_tokens"]
+        self.metrics["prompt_tokens"] += aggregated_metrics["prompt_tokens"]
+        self.metrics["completion_tokens"] += aggregated_metrics["completion_tokens"]
+        self.metrics["document_summaries_tokens"] += aggregated_metrics["document_summaries_tokens"]
         self.metrics["num_documents_summarized"] = len(source_documents)
         
         return summaries, summary_metadata
@@ -390,14 +307,8 @@ if __name__ == "__main__":
     
     # Load sample documents
     doc_dir = os.path.join(os.path.dirname(__file__), "data", "source_documents")
-    documents = []
-    for filename in sorted(os.listdir(doc_dir)):
-        if filename.endswith(".txt") or filename.endswith(".pdf"):
-            filepath = os.path.join(doc_dir, filename)
-            if filename.endswith(".txt"):
-                with open(filepath, "r", encoding="utf-8") as f:
-                    documents.append(f.read())
-            # PDF loading will be handled by evaluate.py
+    from utils import load_source_documents
+    documents = load_source_documents(doc_dir)
     
     # Example synthesis task
     task = "Write a comprehensive executive summary about artificial intelligence"
