@@ -26,7 +26,7 @@ class OllamaClient:
     ) -> None:
         self.base_url = (base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")).rstrip("/")
         self.model = model or os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
-        self.timeout_seconds = timeout_seconds
+        self.timeout_seconds = float(os.getenv("OLLAMA_TIMEOUT", str(timeout_seconds)))
         self.num_ctx = int(os.getenv("OLLAMA_NUM_CTX", str(num_ctx)))
 
     def chat(
@@ -65,7 +65,12 @@ class OllamaClient:
         try:
             with urllib.request.urlopen(req, timeout=self.timeout_seconds) as resp:
                 raw = json.loads(resp.read().decode("utf-8"))
-        except (TimeoutError, socket.timeout, urllib.error.URLError, urllib.error.HTTPError) as exc:
+        except (TimeoutError, socket.timeout) as exc:
+            raise RuntimeError(
+                f"Ollama request timed out after {self.timeout_seconds} seconds. "
+                "Try increasing OLLAMA_TIMEOUT environment variable."
+            ) from exc
+        except (urllib.error.URLError, urllib.error.HTTPError) as exc:
             raise RuntimeError(
                 "Could not reach Ollama at "
                 f"{self.base_url}. Ensure 'ollama serve' is running and the model "
