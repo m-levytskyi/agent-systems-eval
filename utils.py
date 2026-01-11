@@ -1,7 +1,8 @@
 import os
 import re
+import json
 import logging
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, Callable
 from pathlib import Path
 from PyPDF2 import PdfReader
 
@@ -50,9 +51,11 @@ def sanitize_document(doc: str) -> str:
     
     return doc.strip()
 
+import tiktoken
+
 def estimate_tokens(text: str) -> int:
     """
-    Rough token estimation: ~4 characters per token for English text.
+    Estimate token count using tiktoken (cl100k_base).
     
     Args:
         text: Input text
@@ -60,7 +63,8 @@ def estimate_tokens(text: str) -> int:
     Returns:
         Estimated token count
     """
-    return len(text) // 4
+    encoding = tiktoken.get_encoding("cl100k_base")
+    return len(encoding.encode(text))
 
 def chunk_document(doc: str, max_tokens: int = 16000) -> List[str]:
     """
@@ -148,3 +152,133 @@ def load_source_documents(doc_dir: str, pattern: str = "*.pdf") -> List[str]:
                 documents.append(f.read())
     
     return documents
+
+def process_documents_with_cache(
+    source_documents: List[str],
+    cache_dir: str,
+    process_chunk_func: Callable[[str, int, int, int], Tuple[str, Dict[str, int]]],
+    logger: logging.Logger,
+) -> Tuple[List[str], List[Dict[str, Any]], Dict[str, int]]:
+    """
+    Process documents with caching, sanitization, and chunking.
+    
+    Args:
+        source_documents: List of raw document texts
+        cache_dir: Directory for cache files
+        process_chunk_func: Function to process a single chunk. 
+                            Signature: (chunk, doc_idx, chunk_idx, total_chunks) -> (summary, metrics)
+        logger: Logger instance
+        
+    Returns:
+        Tuple of (summaries, metadata, aggregated_metrics)
+    """
+    cache_path = Path(cache_dir)
+    cache_path.mkdir(parents=True, exist_ok=True)
+    
+    summaries = []
+    summary_metadata = []
+    aggregated_metrics = {
+        "num_api_calls": 0,
+        "total_tokens": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "document_summaries_tokens": 0
+    }
+    
+    logger.info(f"{'='*60}")
+    logger.info(f"PROCESSING DOCUMENTS: {len(source_documents)} documents")
+    logger.info(f"Cache directory: {cache_dir}")
+    logger.info(f"{'='*60}")
+    
+    for doc_idx, doc in enumerate(source_documents, start=1):
+        # Check cache first
+        cache_file = cache_path / f"doc_{doc_idx}_summary.json"
+        
+        if cache_file.exists():
+            logger.info(f"Document {doc_idx}/{len(source_documents)}: Loading from cache...")
+            with open(cache_file, 'r') as f:
+                cached = json.load(f)
+                summaries.append(cached['summary'])
+                summary_metadata.append(cached['metadata'])
+                
+                # Update metrics from cache with validation
+                tokens_used = cached['metadata'].get('tokens_used', 0)
+                if tokens_used == 0:
+                    logger.warning(
+                        f"⚠️  Cache for document {doc_idx} has tokens_used=0! "
+                        f"This may indicate a bug in cache generation. "
+                        f"Cache file: {cache_file}"
+                    )
+                
+                aggregated_metrics["num_api_calls"] += cached['metadata'].get('num_api_calls', 0)
+                aggregated_metrics["document_summaries_tokens"] += tokens_used
+                aggregated_metrics["total_tokens"] += tokens_used
+                # Estimate split if not available
+                aggregated_metrics["prompt_tokens"] += int(tokens_used * 0.8)
+                aggregated_metrics["completion_tokens"] += int(tokens_used * 0.2)
+            continue
+        
+        logger.info(f"Processing Document {doc_idx}/{len(source_documents)}...")
+        
+        # Sanitize
+        sanitized_doc = sanitize_document(doc)
+        original_tokens = estimate_tokens(doc)
+        sanitized_tokens = estimate_tokens(sanitized_doc)
+        tokens_saved = original_tokens - sanitized_tokens
+        
+        logger.info(f"  Original: ~{original_tokens:,} tokens")
+        logger.info(f"  Sanitized: ~{sanitized_tokens:,} tokens (saved ~{tokens_saved:,})")
+        
+        # Chunk
+        chunks = chunk_document(sanitized_doc, max_tokens=16000)
+        logger.info(f"  Chunks: {len(chunks)}")
+        
+        # Process chunks
+        chunk_summaries = []
+        chunk_metrics_list = []
+        
+        for chunk_idx, chunk in enumerate(chunks, start=1):
+            chunk_tokens = estimate_tokens(chunk)
+            logger.info(f"    Chunk {chunk_idx}/{len(chunks)}: ~{chunk_tokens:,} tokens")
+            
+            summary, metrics = process_chunk_func(chunk, doc_idx, chunk_idx, len(chunks))
+            
+            chunk_summaries.append(summary)
+            chunk_metrics_list.append(metrics)
+            
+            # Update aggregated metrics
+            aggregated_metrics["num_api_calls"] += 1
+            aggregated_metrics["prompt_tokens"] += metrics.get("prompt_tokens", 0)
+            aggregated_metrics["completion_tokens"] += metrics.get("completion_tokens", 0)
+            aggregated_metrics["total_tokens"] += metrics.get("total_tokens", 0)
+            aggregated_metrics["document_summaries_tokens"] += metrics.get("total_tokens", 0)
+        
+        # Combine chunks
+        if len(chunks) > 1:
+            combined_summary = f"DOCUMENT {doc_idx} (multi-part summary):\n\n" + "\n\n---\n\n".join(chunk_summaries)
+        else:
+            combined_summary = f"DOCUMENT {doc_idx}:\n\n{chunk_summaries[0]}"
+        
+        summaries.append(combined_summary)
+        metadata = {
+            "doc_index": doc_idx,
+            "original_length": len(doc),
+            "sanitized_length": len(sanitized_doc),
+            "num_chunks": len(chunks),
+            "summary_length": len(combined_summary),
+            "tokens_used": sum(m.get("total_tokens", 0) for m in chunk_metrics_list),
+            "num_api_calls": len(chunks),
+        }
+        summary_metadata.append(metadata)
+        
+        # Save checkpoint
+        with open(cache_file, 'w') as f:
+            json.dump({
+                'summary': combined_summary,
+                'metadata': metadata
+            }, f, indent=2)
+        
+        logger.info(f"  Summary: {len(combined_summary)} chars, {metadata['tokens_used']} tokens")
+        logger.info(f"  ✓ Checkpoint saved to {cache_file}")
+        
+    return summaries, summary_metadata, aggregated_metrics
