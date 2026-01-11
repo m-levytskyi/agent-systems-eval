@@ -48,3 +48,6 @@ Thumbs.db
 
 # Cache directories
 data/cache/
+
+#Logs
+*.log
