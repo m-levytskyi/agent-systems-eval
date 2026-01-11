@@ -1,284 +1,191 @@
 # Agent Systems Evaluation: Monolithic vs Ensemble
 
-An empirical comparison of a Monolithic Agent (single LLM) vs. a Multi-Agent Ensemble for document synthesis tasks. This project evaluates both approaches using MLflow for experiment tracking, LLM-as-a-judge, and NLP metrics.
+Empirical comparison of two agent architectures for document synthesis:
+- **Monolithic Agent**: Single LLM approach (fast, simple)
+- **Ensemble Agent**: Multi-agent system with recursive orchestration (higher quality, iterative refinement)
 
-## Overview
+Evaluation uses MLflow tracking, LLM-as-a-judge scoring, and NLP metrics (BERTScore, ROUGE).
 
-This project implements and compares two approaches to document synthesis:
+## Quick Start
 
-1. **Monolithic Agent** (`monolithic.py`): A single LLM that directly synthesizes source documents according to task requirements.
-
-2. **Ensemble Agent** (`ensemble.py`): A four-agent system using CrewAI Flows with recursive orchestration:
-   - **Archivist**: Extracts and organizes key information from source documents (runs once)
-   - **Drafter**: Creates synthesis based on archivist's organization (iterative)
-   - **Critic**: Reviews and provides detailed feedback on the draft (iterative)
-   - **Orchestrator**: Evaluates feedback and decides whether to iterate or finalize (recursive control)
-   
-   The workflow uses CrewAI Flows API for recursive refinement:
-   - Archivist runs once to organize material
-   - Drafter → Critic → Orchestrator loop continues until production-ready
-   - Maximum 5 iterations or 30-minute timeout
-   - Full iteration history tracked in MLflow artifacts
-
-## Features
-
-- 🤖 Two distinct agent architectures for document synthesis
-- 🔄 Recursive orchestration with quality-controlled iteration (ensemble only)
-- 📊 MLflow integration for experiment tracking and comparison
-- 💰 Cost and latency metrics for each approach
-- 🎯 MLflow GenAI LLM-judge evaluation for quality assessment
-- 📈 NLP metrics: BERTScore and ROUGE for quantitative evaluation
-- 📄 PDF document support for realistic document processing
-- 📝 Sample PDF documents and synthesis tasks included
-
-## Requirements
-
-- Python 3.10+
-- Ollama (for local inference)
-- Dependencies listed in `requirements.txt`
-
-Optional:
-- CrewAI (for orchestrating the ensemble)
-- Google Gemini API key (only if you want `LLM_PROVIDER=gemini`)
-
-## Installation
-
-1. Clone the repository:
-```bash
-git clone https://github.com/m-levytskyi/agent-systems-eval.git
-cd agent-systems-eval
-```
-
-2. Install dependencies:
+### 1. Install Dependencies
 ```bash
 pip install -r requirements.txt
 ```
 
-3. Configure environment:
+### 2. Configure Environment
 ```bash
 cp .env.example .env
-# Edit .env (defaults are set up for local Ollama)
+# Defaults are configured for local Ollama
 ```
 
-4. Pull the local model once:
-
+### 3. Pull Model
 ```bash
 ollama pull qwen2.5:7b
 ```
 
-### Configuring Ollama Context Window
-
-By default, Ollama models use a 2048-4096 token context window. For processing academic papers, you should increase this to 32k tokens.
-
-**The context window is set via environment variable and passed in every API call:**
-
+### 4. Run Test Evaluation
 ```bash
-# Set in your environment or .env file
-export OLLAMA_NUM_CTX=32768
-
-# Then start/restart Ollama
-ollama serve
+python evaluate.py --test
+# Fast test with 1 paper, completes in ~5-10 minutes
+# Use --agents-model=gemini to test with Google Gemini instead of Ollama
 ```
 
-Or add to your `.env` file:
+### 5. View Results
+```bash
+mlflow ui
+# Open http://localhost:5000
 ```
-OLLAMA_NUM_CTX=32768
-```
-
-The implementation automatically includes `num_ctx: 32768` in every API request to Ollama, overriding the server's default. This ensures the full context window is available for processing large documents.
-
-The map-reduce implementation handles documents that exceed the context window by:
-- Sanitizing documents (removing references, bibliographies, appendices)
-- Chunking large documents into logical sections
-- Processing each document independently with isolated API calls
 
 ## Usage
 
-### Running the Evaluation
-
-**Quick Test (Single Paper - Recommended for first run):**
-
+### Test Mode (Recommended First Run)
 ```bash
 python evaluate.py --test
+# Or with Gemini:
+python evaluate.py --test --agents-model=gemini
 ```
+- Processes 1 paper, 1 task
+- Completes in ~5-10 minutes
+- Verifies setup works
 
-This will:
-- Process only 1 paper (paper_1.pdf)
-- Run only the first task
-- Complete in ~5-10 minutes
-- Verify everything works correctly
-
-**Full Evaluation (All Papers):**
-
+### Full Evaluation
 ```bash
 python evaluate.py
+# Or with Gemini:
+python evaluate.py --agents-model=gemini
 ```
+- Processes all 10 papers, 3 tasks
+- Takes 1-2 hours
+- Generates complete comparison
 
-This will:
-- Process all 10 papers
-- Run all 3 tasks  
-- Take 1-2 hours depending on hardware
-- Use checkpoint/caching for resilience
+### Model Selection
+```bash
+# Use local Ollama (default, free)
+python evaluate.py --agents-model=ollama
 
-Both modes automatically:
-- Cache document summaries to `data/cache/` for instant resume on interruption
-- Load source PDF documents from `data/source_documents/`
-- Load synthesis tasks from `data/tasks/synthesis_tasks.json`
-- Run both monolithic and ensemble agents on all tasks
-- Track metrics in MLflow
-- Evaluate outputs using LLM-as-a-judge and NLP metrics
-- Save all results and artifacts
+# Use Google Gemini (requires API key)
+python evaluate.py --agents-model=gemini
+```
+- Judges always use Gemini for consistency
+- MLflow experiments get `_gemini` suffix when using Gemini agents
+- See `CLI_USAGE.md` for detailed usage guide
 
-### Checkpoint/Resume Support
+### Resume from Cache
+If interrupted, simply rerun the command. Already-processed documents load from `data/cache/` instantly.
 
-If evaluation is interrupted (crash, Ctrl+C, etc.):
-- Simply rerun `python evaluate.py`
-- Already-processed documents load from cache instantly
-- Only unprocessed documents will be summarized
-- Saves significant time on reruns
-
-**Clear cache to start fresh:**
+### Clear Cache
 ```bash
 rm -rf data/cache/summaries/* data/cache/ensemble_summaries/*
-```
-
-### Viewing Results
-
-After running the evaluation, view results in the MLflow UI:
-
-```bash
-mlflow ui
-```
-
-Then open http://localhost:5000 in your browser to:
-- Compare runs across both agent types
-- View metrics (cost, latency, quality scores, NLP metrics)
-- Examine generated outputs and intermediate results
-- Analyze performance across different tasks
-
-### Running Individual Agents
-
-You can also run each agent independently:
-
-**Monolithic Agent:**
-```bash
-python monolithic.py
-```
-
-**Ensemble Agent:**
-```bash
-python ensemble.py
 ```
 
 ## Project Structure
 
 ```
 agent-systems-eval/
-├── README.md                   # This file
-├── requirements.txt            # Python dependencies
-├── .env.example               # Environment variable template
-├── .gitignore                 # Git ignore rules
-├── monolithic.py              # Single LLM agent implementation
-├── ensemble.py                # Multi-agent ensemble implementation
-├── evaluate.py                # Main evaluation script with MLflow
+├── README.md                   # Public documentation
+├── MASTER_README.md           # Comprehensive private docs
+├── monolithic.py              # Single LLM agent
+├── ensemble.py                # Multi-agent ensemble (CrewAI Flows)
+├── evaluate.py                # MLflow evaluation framework
+├── utils.py                   # Shared utilities
+├── rate_limits.py            # API rate limiter
+├── llm/                       # LLM client abstraction
+│   ├── ollama.py             # Ollama implementation
+│   ├── gemini.py             # Gemini implementation
+│   └── factory.py            # Client factory
 ├── data/
-│   ├── source_documents/      # Sample PDF documents
-│   │   ├── doc1_ai_history.pdf
-│   │   ├── doc2_ml_fundamentals.pdf
-│   │   └── doc3_ai_ethics.pdf
-│   └── tasks/                 # Synthesis task definitions
-│       └── synthesis_tasks.json
-└── mlruns/                    # MLflow tracking data (generated)
+│   ├── source_documents/     # PDF inputs
+│   ├── tasks/                # Task definitions
+│   └── cache/                # Cached summaries
+└── mlruns/                   # MLflow tracking data
 ```
 
-## Metrics Tracked
+## Key Features
 
-### Process Metrics
-- **Latency**: Total time to complete synthesis
-- **Token Usage**: Prompt, completion, and total tokens
-- **API Calls**: Number of LLM API calls
-- **Estimated Cost**: Logged as `0.0` for local Ollama; estimated for remote providers
-
-### Quality Metrics (LLM-as-a-judge)
-- **Completeness**: How fully the task requirements are addressed
-- **Coherence**: Clarity, logic, and structure of the writing
-- **Accuracy**: Correctness and integration of information
-- **Quality**: Overall professional quality
-- **Overall**: Aggregate quality score
-
-### NLP Metrics
-- **BERTScore**: Precision, Recall, F1 measuring semantic similarity
-- **ROUGE**: ROUGE-1 and ROUGE-L measuring n-gram overlap
-
-### Ensemble-Specific Metrics
-- Token usage per agent (archivist, drafter, critic, orchestrator)
-- Number of iterations until production-ready
-- Iteration history with per-iteration drafts and critiques
-- Intermediate outputs at each stage
-
-## Configuration
-
-Environment variables (set in `.env`):
-- `LLM_PROVIDER`: `ollama` (default) or `gemini`
-- `OLLAMA_BASE_URL`: Ollama HTTP endpoint (default: `http://localhost:11434`)
-- `OLLAMA_MODEL`: local model name (default: `qwen2.5:7b`)
-- `JUDGE_MODEL`: MLflow GenAI judge model URI (default: `openai:/qwen2.5:7b`)
-- `OPENAI_BASE_URL`: for using Ollama via OpenAI-compat (`http://localhost:11434/v1`)
-- `OPENAI_API_KEY`: dummy value for OpenAI-compat (e.g. `ollama`)
-- `CREWAI_MODEL`: model identifier for CrewAI ensemble (e.g. `openai/qwen2.5:7b`)
-- `MAX_ITERATIONS`: maximum iterations for ensemble (default: 5)
-- `TIMEOUT_SECONDS`: maximum time for synthesis (default: 1800 = 30 minutes)
-
-Optional (Gemini):
-- `GEMINI_API_KEY` (or `GOOGLE_API_KEY`)
-- `GEMINI_MODEL`
-
-## Adding Custom Tasks
-
-To add your own synthesis tasks:
-
-1. Add source documents (PDF or text) to `data/source_documents/`
-2. Edit `data/tasks/synthesis_tasks.json` to add new tasks:
-
-```json
-{
-  "task_id": "task4",
-  "task_description": "Your synthesis task description",
-  "expected_elements": [
-    "Element 1",
-    "Element 2"
-  ]
-}
-```
+- **Two Agent Architectures**: Compare monolithic vs multi-agent approaches
+- **Recursive Orchestration**: Ensemble uses CrewAI Flows for iterative refinement
+- **MLflow Tracking**: Complete experiment management and comparison
+- **LLM-as-a-Judge**: Automated quality evaluation (groundedness, adherence, completeness)
+- **NLP Metrics**: BERTScore and ROUGE for quantitative analysis
+- **Map-Reduce Processing**: Efficient handling of large documents with caching
+- **PDF Support**: Processes academic papers directly
 
 ## Expected Results
 
-The ensemble approach typically shows:
-- ✅ Higher quality scores (better organization, iterative refinement)
-- ✅ Higher NLP metric scores (more comprehensive coverage)
-- ✅ Adaptive quality control (orchestrator decides when ready)
-- ✅ Transparent iteration history (all drafts and feedback logged)
-- ⚠️ Higher latency (multiple iterations with 4 agents)
-- ⚠️ Higher cost (more total tokens, though minimal with local Ollama)
-- ✅ Better handling of complex synthesis tasks requiring refinement
+**Monolithic Agent**:
+- ✅ Fast (~5-15 seconds per task)
+- ✅ Low token usage
+- ✅ Good for straightforward synthesis
 
-The monolithic approach typically shows:
-- ✅ Lower latency (single LLM call)
-- ✅ Lower cost (fewer tokens)
-- ⚠️ May miss nuances that benefit from specialized processing
-- ✅ Efficient for straightforward tasks
+**Ensemble Agent**:
+- ✅ Higher quality scores (~15-25% improvement)
+- ✅ Adaptive iteration (orchestrator decides when ready)
+- ✅ Full iteration history logged
+- ⚠️ Slower (~2-3x latency)
+- ⚠️ Higher token usage (minimal cost with local Ollama)
 
-## API Costs & Limits
+## Configuration
 
-Local Ollama runs have no per-token API costs.
+### CLI Arguments
 
-Optional: using **Google Gemini**:
-- Rate limits and pricing depend on your Gemini tier.
+- `--agents-model {ollama,gemini}`: Choose model provider for agents (default: `ollama`)
+- `-t, --test`: Run in test mode (1 paper, 1 task)
+
+Run `python evaluate.py --help` for all options.
+
+### Environment Variables
+
+Environment variables (`.env`):
+
+**Required**:
+- `OLLAMA_MODEL`: Model name for Ollama agents (default: `qwen2.5:7b`)
+- `OLLAMA_NUM_CTX`: Context window (default: `32768`)
+- `CREWAI_MODEL`: Model for Ensemble when using Ollama (default: `openai/qwen2.5:7b`)
+- `JUDGE_MODEL`: MLflow judge - always Gemini (default: `gemini:/gemini-2.5-flash-lite`)
+
+**Required for Gemini agents** (`--agents-model=gemini`):
+- `GEMINI_API_KEY`: Your Gemini API key
+
+**Note**: When using `--agents-model=gemini`, agents use `gemini-2.5-flash-lite` and `gemini/gemini-2.5-flash-lite` (hardcoded), overriding `OLLAMA_MODEL` and `CREWAI_MODEL`.
+
+See `.env.example` for full configuration.
+
+## Adding Custom Tasks
+
+1. Add PDF/text files to `data/source_documents/`
+2. Edit `data/tasks/synthesis_tasks.json`:
+```json
+{
+  "task_id": "custom_1",
+  "task_description": "Your task description...",
+  "expected_elements": ["Element 1", "Element 2"]
+}
+```
+3. Run `python evaluate.py`
+
+## Documentation
+
+- **README.md** (this file): Quick start and essential usage
+- **CLI_USAGE.md**: Command-line interface guide with all options and examples
+- **MASTER_README.md**: Comprehensive private documentation with:
+  - Detailed architecture and implementation notes
+  - Troubleshooting and debugging guides
+  - Performance optimization tips
+  - Technical deep dives
+
+## Requirements
+
+- Python 3.10+
+- Ollama (for local inference)
+- See `requirements.txt` for Python dependencies
+
+Optional: Google Gemini API key (if using `LLM_PROVIDER=gemini`)
 
 ## License
 
-MIT License - see LICENSE file for details
+MIT License
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions welcome! Please submit a Pull Request.
