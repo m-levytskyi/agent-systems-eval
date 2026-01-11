@@ -12,7 +12,7 @@ from typing import Deque
 class RequestRateLimiter:
     """Throttle outbound requests to avoid exceeding provider quotas."""
 
-    def __init__(self, max_per_minute: int = 4, max_per_day: int = 15):
+    def __init__(self, max_per_minute: int = 10, max_per_day: int = 20):
         self.max_per_minute = max_per_minute
         self.max_per_day = max_per_day
         self._recent_calls: Deque[float] = deque()
@@ -47,6 +47,9 @@ class RequestRateLimiter:
                 self._recent_calls.append(now)
                 self._day_count += 1
                 return
+            
+            # Wait a bit before checking again to avoid busy loop
+            time.sleep(1)
 
             # Wait for the earliest call to exit the 60s window
             wait_time = max(0.0, 60 - (now - self._recent_calls[0]))
